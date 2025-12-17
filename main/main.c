@@ -16,6 +16,9 @@
 #include "esp_heap_caps.h"
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_io_i80.h"
 #include "esp_lcd_panel_vendor.h"
@@ -57,6 +60,12 @@
 #define BUTTON_GPIO 0
 #define BUTTON_GPIO_2 14
 
+#define BAT_ADC_UNIT ADC_UNIT_1
+#define BAT_ADC_CHANNEL ADC_CHANNEL_3
+#define BAT_ADC_ATTEN ADC_ATTEN_DB_12
+#define BAT_VOLT_DIVIDER_NUM 2
+#define BAT_VOLT_DIVIDER_DEN 1
+
 static const char *TAG = "NET-IMG";
 
 // --- Wi-Fi ---
@@ -64,6 +73,10 @@ static const char *TAG = "NET-IMG";
 #define WIFI_FAIL_BIT      BIT1
 static EventGroupHandle_t s_wifi_event_group;
 static volatile bool s_wifi_connected = false;
+
+static adc_oneshot_unit_handle_t s_adc_handle;
+static adc_cali_handle_t s_adc_cali;
+static bool s_adc_cali_enabled = false;
 
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
@@ -173,6 +186,107 @@ static void lcd_fill_color(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, ui
     esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, frame_buf);
 }
 
+#define FONT_FIRST_CHAR 32
+#define FONT_LAST_CHAR 126
+#define FONT_WIDTH 5
+#define FONT_HEIGHT 7
+#define FONT_SCALE 2
+
+static const uint8_t font5x7[95][5] = {
+    {0x00, 0x00, 0x00, 0x00, 0x00}, {0x00, 0x00, 0x5f, 0x00, 0x00},
+    {0x00, 0x07, 0x00, 0x07, 0x00}, {0x14, 0x7f, 0x14, 0x7f, 0x14},
+    {0x24, 0x2a, 0x7f, 0x2a, 0x12}, {0x23, 0x13, 0x08, 0x64, 0x62},
+    {0x36, 0x49, 0x55, 0x22, 0x50}, {0x00, 0x05, 0x03, 0x00, 0x00},
+    {0x00, 0x1c, 0x22, 0x41, 0x00}, {0x00, 0x41, 0x22, 0x1c, 0x00},
+    {0x14, 0x08, 0x3e, 0x08, 0x14}, {0x08, 0x08, 0x3e, 0x08, 0x08},
+    {0x00, 0x50, 0x30, 0x00, 0x00}, {0x08, 0x08, 0x08, 0x08, 0x08},
+    {0x00, 0x60, 0x60, 0x00, 0x00}, {0x20, 0x10, 0x08, 0x04, 0x02},
+    {0x3e, 0x51, 0x49, 0x45, 0x3e}, {0x00, 0x42, 0x7f, 0x40, 0x00},
+    {0x42, 0x61, 0x51, 0x49, 0x46}, {0x21, 0x41, 0x45, 0x4b, 0x31},
+    {0x18, 0x14, 0x12, 0x7f, 0x10}, {0x27, 0x45, 0x45, 0x45, 0x39},
+    {0x3c, 0x4a, 0x49, 0x49, 0x30}, {0x01, 0x71, 0x09, 0x05, 0x03},
+    {0x36, 0x49, 0x49, 0x49, 0x36}, {0x06, 0x49, 0x49, 0x29, 0x1e},
+    {0x00, 0x36, 0x36, 0x00, 0x00}, {0x00, 0x56, 0x36, 0x00, 0x00},
+    {0x08, 0x14, 0x22, 0x41, 0x00}, {0x14, 0x14, 0x14, 0x14, 0x14},
+    {0x00, 0x41, 0x22, 0x14, 0x08}, {0x02, 0x01, 0x51, 0x09, 0x06},
+    {0x32, 0x49, 0x79, 0x41, 0x3e}, {0x7e, 0x11, 0x11, 0x11, 0x7e},
+    {0x7f, 0x49, 0x49, 0x49, 0x36}, {0x3e, 0x41, 0x41, 0x41, 0x22},
+    {0x7f, 0x41, 0x41, 0x22, 0x1c}, {0x7f, 0x49, 0x49, 0x49, 0x41},
+    {0x7f, 0x09, 0x09, 0x09, 0x01}, {0x3e, 0x41, 0x49, 0x49, 0x7a},
+    {0x7f, 0x08, 0x08, 0x08, 0x7f}, {0x00, 0x41, 0x7f, 0x41, 0x00},
+    {0x20, 0x40, 0x41, 0x3f, 0x01}, {0x7f, 0x08, 0x14, 0x22, 0x41},
+    {0x7f, 0x40, 0x40, 0x40, 0x40}, {0x7f, 0x02, 0x0c, 0x02, 0x7f},
+    {0x7f, 0x04, 0x08, 0x10, 0x7f}, {0x3e, 0x41, 0x41, 0x41, 0x3e},
+    {0x7f, 0x09, 0x09, 0x09, 0x06}, {0x3e, 0x41, 0x51, 0x21, 0x5e},
+    {0x7f, 0x09, 0x19, 0x29, 0x46}, {0x46, 0x49, 0x49, 0x49, 0x31},
+    {0x01, 0x01, 0x7f, 0x01, 0x01}, {0x3f, 0x40, 0x40, 0x40, 0x3f},
+    {0x1f, 0x20, 0x40, 0x20, 0x1f}, {0x3f, 0x40, 0x38, 0x40, 0x3f},
+    {0x63, 0x14, 0x08, 0x14, 0x63}, {0x07, 0x08, 0x70, 0x08, 0x07},
+    {0x61, 0x51, 0x49, 0x45, 0x43}, {0x00, 0x7f, 0x41, 0x41, 0x00},
+    {0x02, 0x04, 0x08, 0x10, 0x20}, {0x00, 0x41, 0x41, 0x7f, 0x00},
+    {0x04, 0x02, 0x01, 0x02, 0x04}, {0x40, 0x40, 0x40, 0x40, 0x40},
+    {0x00, 0x01, 0x02, 0x04, 0x00}, {0x20, 0x54, 0x54, 0x54, 0x78},
+    {0x7f, 0x48, 0x44, 0x44, 0x38}, {0x38, 0x44, 0x44, 0x44, 0x20},
+    {0x38, 0x44, 0x44, 0x48, 0x7f}, {0x38, 0x54, 0x54, 0x54, 0x18},
+    {0x08, 0x7e, 0x09, 0x01, 0x02}, {0x0c, 0x52, 0x52, 0x52, 0x3e},
+    {0x7f, 0x08, 0x04, 0x04, 0x78}, {0x00, 0x44, 0x7d, 0x40, 0x00},
+    {0x20, 0x40, 0x44, 0x3d, 0x00}, {0x7f, 0x10, 0x28, 0x44, 0x00},
+    {0x00, 0x41, 0x7f, 0x40, 0x00}, {0x7c, 0x04, 0x18, 0x04, 0x78},
+    {0x7c, 0x08, 0x04, 0x04, 0x78}, {0x38, 0x44, 0x44, 0x44, 0x38},
+    {0x7c, 0x14, 0x14, 0x14, 0x08}, {0x08, 0x14, 0x14, 0x18, 0x7c},
+    {0x7c, 0x08, 0x04, 0x04, 0x08}, {0x48, 0x54, 0x54, 0x54, 0x20},
+    {0x04, 0x3f, 0x44, 0x40, 0x20}, {0x3c, 0x40, 0x40, 0x20, 0x7c},
+    {0x1c, 0x20, 0x40, 0x20, 0x1c}, {0x3c, 0x40, 0x30, 0x40, 0x3c},
+    {0x44, 0x28, 0x10, 0x28, 0x44}, {0x0c, 0x50, 0x50, 0x50, 0x3c},
+    {0x44, 0x64, 0x54, 0x4c, 0x44}, {0x00, 0x08, 0x36, 0x41, 0x00},
+    {0x00, 0x00, 0x7f, 0x00, 0x00}, {0x00, 0x41, 0x36, 0x08, 0x00},
+    {0x08, 0x04, 0x08, 0x10, 0x08}
+};
+
+static void framebuf_fill_color(uint16_t *frame_buf, uint16_t color) {
+    size_t pixel_count = (size_t)LCD_H_RES * (size_t)LCD_V_RES;
+    for (size_t i = 0; i < pixel_count; i++) {
+        frame_buf[i] = color;
+    }
+}
+
+static void lcd_draw_char(uint16_t *frame_buf, int x, int y, char c, uint16_t color) {
+    if (!frame_buf) return;
+    if (c < FONT_FIRST_CHAR || c > FONT_LAST_CHAR) {
+        c = '?';
+    }
+    const uint8_t *glyph = font5x7[c - FONT_FIRST_CHAR];
+    for (int col = 0; col < FONT_WIDTH; col++) {
+        uint8_t line = glyph[col];
+        for (int row = 0; row < FONT_HEIGHT; row++) {
+            if (line & 0x01) {
+                int px = x + col * FONT_SCALE;
+                int py = y + row * FONT_SCALE;
+                for (int dy = 0; dy < FONT_SCALE; dy++) {
+                    for (int dx = 0; dx < FONT_SCALE; dx++) {
+                        int fx = px + dx;
+                        int fy = py + dy;
+                        if (fx >= 0 && fy >= 0 && fx < LCD_H_RES && fy < LCD_V_RES) {
+                            frame_buf[fy * LCD_H_RES + fx] = color;
+                        }
+                    }
+                }
+            }
+            line >>= 1;
+        }
+    }
+}
+
+static void lcd_draw_text(uint16_t *frame_buf, int x, int y, const char *text, uint16_t color) {
+    if (!frame_buf || !text) return;
+    int cursor_x = x;
+    while (*text) {
+        lcd_draw_char(frame_buf, cursor_x, y, *text, color);
+        cursor_x += (FONT_WIDTH + 1) * FONT_SCALE;
+        text++;
+    }
+}
+
 #define MENU_ITEMS 4
 #define MENU_ITEM_POWER 3
 
@@ -196,22 +310,36 @@ static void lcd_draw_rect_outline(uint16_t *frame_buf, int x, int y, int w, int 
     lcd_fill_rect(frame_buf, x + w - 1, y, 1, h, color);
 }
 
-static void lcd_render_menu(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, int selected) {
+static void lcd_render_menu(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, int selected, int bat_mv) {
     if (!frame_buf) return;
-    lcd_fill_color(panel, frame_buf, 0x0000);
+    framebuf_fill_color(frame_buf, 0x0000);
     const int box_w = LCD_H_RES - 30;
     const int box_h = 40;
     const int gap = 10;
     const int total_h = MENU_ITEMS * box_h + (MENU_ITEMS - 1) * gap;
     const int start_y = (LCD_V_RES - total_h) / 2;
     const int start_x = 15;
+    char voltage_label[24];
+    if (bat_mv > 0) {
+        snprintf(voltage_label, sizeof(voltage_label), "VOLT %d.%02dV", bat_mv / 1000, (bat_mv % 1000) / 10);
+    } else {
+        snprintf(voltage_label, sizeof(voltage_label), "VOLT --.-V");
+    }
+    const char *labels[MENU_ITEMS] = {
+        voltage_label,
+        "EMPTY",
+        "EMPTY",
+        "POWER OFF",
+    };
     for (int i = 0; i < MENU_ITEMS; i++) {
         int y = start_y + i * (box_h + gap);
         if (i == selected) {
             lcd_fill_rect(frame_buf, start_x, y, box_w, box_h, 0xFFFF);
             lcd_draw_rect_outline(frame_buf, start_x, y, box_w, box_h, 0x0000);
+            lcd_draw_text(frame_buf, start_x + 10, y + 12, labels[i], 0x0000);
         } else {
             lcd_draw_rect_outline(frame_buf, start_x, y, box_w, box_h, 0xFFFF);
+            lcd_draw_text(frame_buf, start_x + 10, y + 12, labels[i], 0xFFFF);
         }
     }
     esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, frame_buf);
@@ -249,6 +377,66 @@ static void enter_deep_sleep(void) {
         gpio_set_level((gpio_num_t)PIN_NUM_PWR, 0);
     }
     esp_deep_sleep_start();
+}
+
+static void init_battery_adc(void) {
+    adc_oneshot_unit_init_cfg_t init_cfg = {
+        .unit_id = BAT_ADC_UNIT,
+        .ulp_mode = ADC_ULP_MODE_DISABLE
+    };
+    if (adc_oneshot_new_unit(&init_cfg, &s_adc_handle) != ESP_OK) {
+        s_adc_handle = NULL;
+        return;
+    }
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = BAT_ADC_ATTEN
+    };
+    if (adc_oneshot_config_channel(s_adc_handle, BAT_ADC_CHANNEL, &chan_cfg) != ESP_OK) {
+        adc_oneshot_del_unit(s_adc_handle);
+        s_adc_handle = NULL;
+        return;
+    }
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    {
+        adc_cali_curve_fitting_config_t cali_cfg = {
+            .unit_id = BAT_ADC_UNIT,
+            .atten = BAT_ADC_ATTEN,
+            .bitwidth = ADC_BITWIDTH_DEFAULT
+        };
+        if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_adc_cali) == ESP_OK) {
+            s_adc_cali_enabled = true;
+        }
+    }
+#elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    {
+        adc_cali_line_fitting_config_t cali_cfg = {
+            .unit_id = BAT_ADC_UNIT,
+            .atten = BAT_ADC_ATTEN,
+            .bitwidth = ADC_BITWIDTH_DEFAULT
+        };
+        if (adc_cali_create_scheme_line_fitting(&cali_cfg, &s_adc_cali) == ESP_OK) {
+            s_adc_cali_enabled = true;
+        }
+    }
+#endif
+}
+
+static int read_battery_voltage_mv(void) {
+    if (!s_adc_handle) {
+        return -1;
+    }
+    int raw = 0;
+    if (adc_oneshot_read(s_adc_handle, BAT_ADC_CHANNEL, &raw) != ESP_OK) {
+        return -1;
+    }
+    if (s_adc_cali_enabled) {
+        int voltage_mv = 0;
+        if (adc_cali_raw_to_voltage(s_adc_cali, raw, &voltage_mv) == ESP_OK) {
+            return (voltage_mv * BAT_VOLT_DIVIDER_NUM) / BAT_VOLT_DIVIDER_DEN;
+        }
+    }
+    return ((raw * 1100) / 4095) * BAT_VOLT_DIVIDER_NUM / BAT_VOLT_DIVIDER_DEN;
 }
 
 void app_main(void)
@@ -330,6 +518,8 @@ void app_main(void)
         gpio_set_level((gpio_num_t)PIN_NUM_BL, 1);
     }
 
+    init_battery_adc();
+
     // --- Buffers ---
     jpeg_buffer = heap_caps_malloc(MAX_JPEG_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!jpeg_buffer) jpeg_buffer = malloc(MAX_JPEG_SIZE); // Fallback to internal RAM
@@ -407,14 +597,14 @@ void app_main(void)
             if (!menu_visible) {
                 menu_visible = true;
                 menu_selected = 0;
-                lcd_render_menu(panel_handle, (uint16_t *)out_buf, menu_selected);
+                lcd_render_menu(panel_handle, (uint16_t *)out_buf, menu_selected, read_battery_voltage_mv());
             } else {
                 menu_selected++;
                 if (menu_selected >= MENU_ITEMS) {
                     menu_visible = false;
                     lcd_fill_color(panel_handle, (uint16_t *)out_buf, 0x0000);
                 } else {
-                    lcd_render_menu(panel_handle, (uint16_t *)out_buf, menu_selected);
+                    lcd_render_menu(panel_handle, (uint16_t *)out_buf, menu_selected, read_battery_voltage_mv());
                 }
             }
         }
