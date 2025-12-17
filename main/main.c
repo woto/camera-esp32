@@ -14,6 +14,8 @@
 #include "driver/gpio.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_io_i80.h"
 #include "esp_lcd_panel_vendor.h"
@@ -51,6 +53,9 @@
 #define LCD_X_OFFSET 35
 #define LCD_Y_OFFSET 0
 #define LCD_PIXEL_CLOCK_HZ (20 * 1000 * 1000)
+
+#define BUTTON_GPIO 0
+#define BUTTON_GPIO_2 14
 
 static const char *TAG = "NET-IMG";
 
@@ -166,6 +171,84 @@ static void lcd_fill_color(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, ui
         frame_buf[i] = color;
     }
     esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, frame_buf);
+}
+
+#define MENU_ITEMS 4
+#define MENU_ITEM_POWER 3
+
+static void lcd_fill_rect(uint16_t *frame_buf, int x, int y, int w, int h, uint16_t color) {
+    if (!frame_buf) return;
+    if (x < 0 || y < 0 || x + w > LCD_H_RES || y + h > LCD_V_RES) return;
+    for (int yy = y; yy < y + h; yy++) {
+        uint16_t *row = frame_buf + (yy * LCD_H_RES) + x;
+        for (int xx = 0; xx < w; xx++) {
+            row[xx] = color;
+        }
+    }
+}
+
+static void lcd_draw_rect_outline(uint16_t *frame_buf, int x, int y, int w, int h, uint16_t color) {
+    if (!frame_buf) return;
+    if (x < 0 || y < 0 || x + w > LCD_H_RES || y + h > LCD_V_RES) return;
+    lcd_fill_rect(frame_buf, x, y, w, 1, color);
+    lcd_fill_rect(frame_buf, x, y + h - 1, w, 1, color);
+    lcd_fill_rect(frame_buf, x, y, 1, h, color);
+    lcd_fill_rect(frame_buf, x + w - 1, y, 1, h, color);
+}
+
+static void lcd_render_menu(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, int selected) {
+    if (!frame_buf) return;
+    lcd_fill_color(panel, frame_buf, 0x0000);
+    const int box_w = LCD_H_RES - 30;
+    const int box_h = 40;
+    const int gap = 10;
+    const int total_h = MENU_ITEMS * box_h + (MENU_ITEMS - 1) * gap;
+    const int start_y = (LCD_V_RES - total_h) / 2;
+    const int start_x = 15;
+    for (int i = 0; i < MENU_ITEMS; i++) {
+        int y = start_y + i * (box_h + gap);
+        if (i == selected) {
+            lcd_fill_rect(frame_buf, start_x, y, box_w, box_h, 0xFFFF);
+            lcd_draw_rect_outline(frame_buf, start_x, y, box_w, box_h, 0x0000);
+        } else {
+            lcd_draw_rect_outline(frame_buf, start_x, y, box_w, box_h, 0xFFFF);
+        }
+    }
+    esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, frame_buf);
+}
+
+static void enter_deep_sleep(void) {
+    uint64_t mask = 0;
+    if (esp_sleep_is_valid_wakeup_gpio(BUTTON_GPIO)) {
+        rtc_gpio_init(BUTTON_GPIO);
+        rtc_gpio_set_direction(BUTTON_GPIO, RTC_GPIO_MODE_INPUT_ONLY);
+        rtc_gpio_pullup_en(BUTTON_GPIO);
+        rtc_gpio_pulldown_dis(BUTTON_GPIO);
+        mask |= (1ULL << BUTTON_GPIO);
+    }
+    if (esp_sleep_is_valid_wakeup_gpio(BUTTON_GPIO_2)) {
+        rtc_gpio_init(BUTTON_GPIO_2);
+        rtc_gpio_set_direction(BUTTON_GPIO_2, RTC_GPIO_MODE_INPUT_ONLY);
+        rtc_gpio_pullup_en(BUTTON_GPIO_2);
+        rtc_gpio_pulldown_dis(BUTTON_GPIO_2);
+        mask |= (1ULL << BUTTON_GPIO_2);
+    }
+    if (mask == 0) {
+        ESP_LOGE(TAG, "No valid wakeup GPIOs configured, aborting sleep");
+        return;
+    }
+    while (gpio_get_level(BUTTON_GPIO) == 0 || gpio_get_level(BUTTON_GPIO_2) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW));
+    if (PIN_NUM_BL >= 0) {
+        gpio_set_level((gpio_num_t)PIN_NUM_BL, 0);
+    }
+    if (PIN_NUM_PWR >= 0) {
+        gpio_set_level((gpio_num_t)PIN_NUM_PWR, 0);
+    }
+    esp_deep_sleep_start();
 }
 
 void app_main(void)
@@ -298,9 +381,6 @@ void app_main(void)
     ESP_LOGI(TAG, "Time Set: %s", asctime(&timeinfo));
 
     // --- Button Init ---
-    #define BUTTON_GPIO 0
-    #define BUTTON_GPIO_2 14
-    
     gpio_config_t btn_conf = {
         .pin_bit_mask = (1ULL << BUTTON_GPIO) | (1ULL << BUTTON_GPIO_2),
         .mode = GPIO_MODE_INPUT,
@@ -312,27 +392,60 @@ void app_main(void)
 
     // --- Loop ---
     int image_timer = 0;
+    bool menu_visible = false;
+    int menu_selected = 0;
+    int last_btn_trigger = 1;
+    int last_btn_menu = 1;
+    TickType_t last_press_trigger = 0;
+    TickType_t last_press_menu = 0;
     while (1) {
-        // Button 0 (Boot) Check
-        if (gpio_get_level(BUTTON_GPIO) == 0) {
-            ESP_LOGI(TAG, "Button 0 Pressed! Sending Trigger...");
-            
-             esp_http_client_config_t config_post = {
-                .url = "http://chemical-topics-steady-morris.trycloudflare.com/recorder/trigger",
-                .method = HTTP_METHOD_POST,
-                .timeout_ms = 10000,
-                .crt_bundle_attach = esp_crt_bundle_attach,
-            };
-            esp_http_client_handle_t client_post = esp_http_client_init(&config_post);
-            esp_http_client_perform(client_post);
-            esp_http_client_cleanup(client_post);
-            
-            ESP_LOGI(TAG, "Trigger Sent.");
-            vTaskDelay(pdMS_TO_TICKS(500)); // Debounce / prevent spam
+        int btn_trigger = gpio_get_level(BUTTON_GPIO);
+        int btn_menu = gpio_get_level(BUTTON_GPIO_2);
+        TickType_t now_tick = xTaskGetTickCount();
+        if (last_btn_menu == 1 && btn_menu == 0 && (now_tick - last_press_menu) > pdMS_TO_TICKS(250)) {
+            last_press_menu = now_tick;
+            if (!menu_visible) {
+                menu_visible = true;
+                menu_selected = 0;
+                lcd_render_menu(panel_handle, (uint16_t *)out_buf, menu_selected);
+            } else {
+                menu_selected++;
+                if (menu_selected >= MENU_ITEMS) {
+                    menu_visible = false;
+                    lcd_fill_color(panel_handle, (uint16_t *)out_buf, 0x0000);
+                } else {
+                    lcd_render_menu(panel_handle, (uint16_t *)out_buf, menu_selected);
+                }
+            }
         }
 
+        if (last_btn_trigger == 1 && btn_trigger == 0 && (now_tick - last_press_trigger) > pdMS_TO_TICKS(250)) {
+            last_press_trigger = now_tick;
+            if (menu_visible) {
+                if (menu_selected == MENU_ITEM_POWER) {
+                    enter_deep_sleep();
+                }
+            } else {
+                ESP_LOGI(TAG, "Button 0 Pressed! Sending Trigger...");
+
+                esp_http_client_config_t config_post = {
+                    .url = "http://chemical-topics-steady-morris.trycloudflare.com/recorder/trigger",
+                    .method = HTTP_METHOD_POST,
+                    .timeout_ms = 10000,
+                    .crt_bundle_attach = esp_crt_bundle_attach,
+                };
+                esp_http_client_handle_t client_post = esp_http_client_init(&config_post);
+                esp_http_client_perform(client_post);
+                esp_http_client_cleanup(client_post);
+
+                ESP_LOGI(TAG, "Trigger Sent.");
+            }
+        }
+        last_btn_trigger = btn_trigger;
+        last_btn_menu = btn_menu;
+
         // Periodic Image Fetch (every ~5 seconds)
-        if (image_timer++ > 50) { // 50 * 100ms = 5000ms
+        if (!menu_visible && image_timer++ > 50) { // 50 * 100ms = 5000ms
             image_timer = 0;
             if (s_wifi_connected) {
                 fetch_image();
@@ -369,6 +482,8 @@ void app_main(void)
             } else if (out_buf && s_wifi_connected) {
                 lcd_fill_color(panel_handle, (uint16_t *)out_buf, 0xFFFF);
             }
+        } else if (menu_visible) {
+            image_timer = 0;
         }
         
         vTaskDelay(pdMS_TO_TICKS(100)); // Check button every 100ms
