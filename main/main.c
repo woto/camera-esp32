@@ -13,8 +13,9 @@
 #include "esp_sntp.h"
 #include "driver/gpio.h"
 #include "esp_crt_bundle.h"
-#include "driver/spi_master.h"
+#include "esp_heap_caps.h"
 #include "esp_lcd_panel_io.h"
+#include "esp_lcd_io_i80.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
 
@@ -24,23 +25,32 @@
 // --- CONFIG ---
 #define WIFI_SSID      "AndroidAP4484"
 #define WIFI_PASS      "dflg7101"
-#define IMAGE_URL      "https://loremflickr.com/128/128"
+#define IMAGE_URL      "https://loremflickr.com/170/320"
 
 // Note: Time Sync is handled in main.
 
 
-// --- T-QT Pro Pinout ---
-#define LCD_HOST    SPI2_HOST
-#define PIN_NUM_MISO -1
-#define PIN_NUM_MOSI 2
-#define PIN_NUM_CLK  3
-#define PIN_NUM_CS   5
-#define PIN_NUM_DC   6
-#define PIN_NUM_RST  1
-#define PIN_NUM_BL   10
-#define LCD_H_RES 128
-#define LCD_V_RES 128
-#define LCD_PIXEL_CLOCK_HZ (40 * 1000 * 1000)
+// --- Lilygo T-Display S3 (1.9" ST7789, 8-bit I80) Pinout ---
+#define PIN_NUM_D0   39
+#define PIN_NUM_D1   40
+#define PIN_NUM_D2   41
+#define PIN_NUM_D3   42
+#define PIN_NUM_D4   45
+#define PIN_NUM_D5   46
+#define PIN_NUM_D6   47
+#define PIN_NUM_D7   48
+#define PIN_NUM_WR   8
+#define PIN_NUM_RD   9
+#define PIN_NUM_DC   7
+#define PIN_NUM_CS   6
+#define PIN_NUM_RST  5
+#define PIN_NUM_BL   38
+#define PIN_NUM_PWR  15
+#define LCD_H_RES 170
+#define LCD_V_RES 320
+#define LCD_X_OFFSET 35
+#define LCD_Y_OFFSET 0
+#define LCD_PIXEL_CLOCK_HZ (20 * 1000 * 1000)
 
 static const char *TAG = "NET-IMG";
 
@@ -48,16 +58,19 @@ static const char *TAG = "NET-IMG";
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 static EventGroupHandle_t s_wifi_event_group;
+static volatile bool s_wifi_connected = false;
 
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_wifi_connected = false;
         esp_wifi_connect();
         ESP_LOGI(TAG, "retry to connect to the AP");
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        s_wifi_connected = true;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -89,7 +102,7 @@ void wifi_init_sta(void) {
 // --- HTTP & Image ---
 
 // --- HTTP & Image ---
-#define MAX_JPEG_SIZE (20 * 1024)
+#define MAX_JPEG_SIZE (80 * 1024)
 static char *jpeg_buffer = NULL;
 static int jpeg_len = 0;
 
@@ -134,8 +147,8 @@ void fetch_image() {
 esp_lcd_panel_handle_t panel_handle = NULL;
 
 void draw_rgb565(uint16_t *pixels, int w, int h) {
-    if (w > 128) w = 128; // Crop if necessary
-    if (h > 128) h = 128;
+    if (w > LCD_H_RES) w = LCD_H_RES; // Crop if necessary
+    if (h > LCD_V_RES) h = LCD_V_RES;
     // Swap bytes for ESP LCD if needed or rely on driver.
     // esp_jpeg_dec usually outputs Big Endian RGB565? No, it's usually host order.
     // ST7789 expects Big Endian.
@@ -145,6 +158,14 @@ void draw_rgb565(uint16_t *pixels, int w, int h) {
         pixels[i] = (pixels[i] >> 8) | (pixels[i] << 8);
     }
     esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, w, h, pixels);
+}
+
+static void lcd_fill_color(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, uint16_t color) {
+    size_t pixel_count = (size_t)LCD_H_RES * (size_t)LCD_V_RES;
+    for (size_t i = 0; i < pixel_count; i++) {
+        frame_buf[i] = color;
+    }
+    esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, frame_buf);
 }
 
 void app_main(void)
@@ -158,31 +179,55 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     // GPIO Hold Dis
-    gpio_hold_dis((gpio_num_t)PIN_NUM_BL);
+    if (PIN_NUM_BL >= 0) {
+        gpio_hold_dis((gpio_num_t)PIN_NUM_BL);
+    }
+
+    if (PIN_NUM_PWR >= 0) {
+        gpio_set_direction((gpio_num_t)PIN_NUM_PWR, GPIO_MODE_OUTPUT);
+        gpio_set_level((gpio_num_t)PIN_NUM_PWR, 1);
+    }
+
+    if (PIN_NUM_RD >= 0) {
+        gpio_set_direction((gpio_num_t)PIN_NUM_RD, GPIO_MODE_OUTPUT);
+        gpio_set_level((gpio_num_t)PIN_NUM_RD, 1);
+    }
 
     // --- LCD Init ---
-    ESP_LOGI(TAG, "Initialize SPI bus");
-    spi_bus_config_t buscfg = {
-        .sclk_io_num = PIN_NUM_CLK,
-        .mosi_io_num = PIN_NUM_MOSI,
-        .miso_io_num = PIN_NUM_MISO,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = LCD_H_RES * LCD_V_RES * 2 + 1024
+    ESP_LOGI(TAG, "Initialize I80 bus");
+    esp_lcd_i80_bus_handle_t i80_bus = NULL;
+    esp_lcd_i80_bus_config_t buscfg = {
+        .dc_gpio_num = PIN_NUM_DC,
+        .wr_gpio_num = PIN_NUM_WR,
+        .clk_src = LCD_CLK_SRC_DEFAULT,
+        .data_gpio_nums = {
+            PIN_NUM_D0, PIN_NUM_D1, PIN_NUM_D2, PIN_NUM_D3,
+            PIN_NUM_D4, PIN_NUM_D5, PIN_NUM_D6, PIN_NUM_D7,
+            -1, -1, -1, -1, -1, -1, -1, -1
+        },
+        .bus_width = 8,
+        .max_transfer_bytes = LCD_H_RES * LCD_V_RES * 2
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    ESP_ERROR_CHECK(esp_lcd_new_i80_bus(&buscfg, &i80_bus));
 
     esp_lcd_panel_io_handle_t io_handle = NULL;
-    esp_lcd_panel_io_spi_config_t io_config = {
-        .dc_gpio_num = PIN_NUM_DC,
+    esp_lcd_panel_io_i80_config_t io_config = {
         .cs_gpio_num = PIN_NUM_CS,
         .pclk_hz = LCD_PIXEL_CLOCK_HZ,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
-        .spi_mode = 0,
         .trans_queue_depth = 10,
+        .dc_levels = {
+            .dc_idle_level = 0,
+            .dc_cmd_level = 0,
+            .dc_dummy_level = 0,
+            .dc_data_level = 1,
+        },
+        .flags = {
+            .swap_color_bytes = 1,
+        },
     };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle));
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i80(i80_bus, &io_config, &io_handle));
 
     esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = PIN_NUM_RST,
@@ -192,19 +237,47 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, 2, 1));
+    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, LCD_X_OFFSET, LCD_Y_OFFSET));
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
 
     // Backlight ON
-    gpio_set_direction((gpio_num_t)PIN_NUM_BL, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)PIN_NUM_BL, 0);
+    if (PIN_NUM_BL >= 0) {
+        gpio_set_direction((gpio_num_t)PIN_NUM_BL, GPIO_MODE_OUTPUT);
+        gpio_set_level((gpio_num_t)PIN_NUM_BL, 1);
+    }
+
+    // --- Buffers ---
+    jpeg_buffer = heap_caps_malloc(MAX_JPEG_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!jpeg_buffer) jpeg_buffer = malloc(MAX_JPEG_SIZE); // Fallback to internal RAM
+
+    // JPEG Output buffer
+    // RGB565 = 2 bytes per pixel
+    size_t out_buf_size = LCD_H_RES * LCD_V_RES * 2;
+    uint8_t *out_buf = heap_caps_malloc(out_buf_size, MALLOC_CAP_DMA);
+    if (!out_buf) out_buf = malloc(out_buf_size);
+
+    if (out_buf) {
+        lcd_fill_color(panel_handle, (uint16_t *)out_buf, 0xFFFF);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        lcd_fill_color(panel_handle, (uint16_t *)out_buf, 0x0000);
+    }
 
     // --- Wifi ---
     ESP_LOGI(TAG, "Connecting to Wi-Fi...");
     wifi_init_sta();
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
-    ESP_LOGI(TAG, "Wi-Fi Connected");
+    EventBits_t wifi_bits = xEventGroupWaitBits(
+        s_wifi_event_group,
+        WIFI_CONNECTED_BIT,
+        pdFALSE,
+        pdFALSE,
+        pdMS_TO_TICKS(10000)
+    );
+    if (wifi_bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "Wi-Fi Connected");
+    } else {
+        ESP_LOGW(TAG, "Wi-Fi connect timeout, continuing without connection");
+    }
 
     // --- SNTP Time Sync ---
     ESP_LOGI(TAG, "Initializing SNTP");
@@ -224,19 +297,9 @@ void app_main(void)
     localtime_r(&now, &timeinfo);
     ESP_LOGI(TAG, "Time Set: %s", asctime(&timeinfo));
 
-    // --- Buffers ---
-    jpeg_buffer = heap_caps_malloc(MAX_JPEG_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!jpeg_buffer) jpeg_buffer = malloc(MAX_JPEG_SIZE); // Fallback to internal RAM
-
-    // JPEG Output buffer
-    // RGB565 = 2 bytes per pixel
-    size_t out_buf_size = 128 * 128 * 2;
-    uint8_t *out_buf = heap_caps_malloc(out_buf_size, MALLOC_CAP_DMA);
-    if (!out_buf) out_buf = malloc(out_buf_size);
-
     // --- Button Init ---
     #define BUTTON_GPIO 0
-    #define BUTTON_GPIO_2 47
+    #define BUTTON_GPIO_2 14
     
     gpio_config_t btn_conf = {
         .pin_bit_mask = (1ULL << BUTTON_GPIO) | (1ULL << BUTTON_GPIO_2),
@@ -271,7 +334,11 @@ void app_main(void)
         // Periodic Image Fetch (every ~5 seconds)
         if (image_timer++ > 50) { // 50 * 100ms = 5000ms
             image_timer = 0;
-            fetch_image();
+            if (s_wifi_connected) {
+                fetch_image();
+            } else {
+                ESP_LOGW(TAG, "Skipping fetch; Wi-Fi not connected");
+            }
 
             if (jpeg_len > 0) {
                 ESP_LOGI(TAG, "Decoding JPEG (%d bytes)...", jpeg_len);
@@ -284,7 +351,7 @@ void app_main(void)
                     .out_format = JPEG_IMAGE_FORMAT_RGB565,
                     .out_scale = JPEG_IMAGE_SCALE_0,
                     .flags = {
-                        .swap_color_bytes = 1,
+                        .swap_color_bytes = 0,
                     }
                 };
                 esp_jpeg_image_output_t outimg;
@@ -295,7 +362,12 @@ void app_main(void)
                     esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, outimg.width, outimg.height, (uint16_t*)out_buf);
                 } else {
                     ESP_LOGE(TAG, "JPEG Decode Error: %d", res);
+                    if (out_buf) {
+                        lcd_fill_color(panel_handle, (uint16_t *)out_buf, 0xFFFF);
+                    }
                 }
+            } else if (out_buf && s_wifi_connected) {
+                lcd_fill_color(panel_handle, (uint16_t *)out_buf, 0xFFFF);
             }
         }
         
