@@ -208,13 +208,15 @@ void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    // Keep Wi-Fi awake during transfers to reduce TLS timeouts
+    esp_wifi_set_ps(WIFI_PS_NONE);
     ESP_LOGI(TAG, "wifi_init_sta finished.");
 }
 
 // --- HTTP & Image ---
-#define MAX_JPEG_SIZE (80 * 1024)
+#define MAX_JPEG_SIZE (32 * 1024)
 #define JSON_BUFFER_SIZE 4096
-#define MAX_IMAGES 8
+#define MAX_IMAGES 32
 #define MAX_URL_LEN 256
 
 typedef struct {
@@ -227,8 +229,7 @@ typedef struct {
     char url[MAX_URL_LEN];
     uint8_t *jpeg;
     int jpeg_len;
-    int width;
-    int height;
+    bool valid;
     bool loaded;
 } image_slot_t;
 
@@ -236,12 +237,11 @@ static char *jpeg_buffer = NULL;
 static int jpeg_len = 0;
 static char json_buffer[JSON_BUFFER_SIZE];
 static image_slot_t s_images[MAX_IMAGES];
+static esp_lcd_panel_handle_t panel_handle = NULL;
 
 static esp_err_t http_collect_event_handler(esp_http_client_event_t *evt) {
     http_buffer_ctx_t *ctx = (http_buffer_ctx_t *)evt->user_data;
-    if (!ctx || !ctx->buf || !ctx->out_len) {
-        return ESP_OK;
-    }
+    if (!ctx || !ctx->buf || !ctx->out_len) return ESP_OK;
     if (evt->event_id == HTTP_EVENT_ON_DATA) {
         int remaining = ctx->max_len - *(ctx->out_len);
         int to_copy = evt->data_len < remaining ? evt->data_len : remaining;
@@ -313,10 +313,9 @@ static bool parse_thumbnail_urls(const char *json, int *out_count) {
         memset(&s_images[idx], 0, sizeof(image_slot_t));
         memcpy(s_images[idx].url, url->valuestring, len);
         s_images[idx].url[len] = '\0';
+        s_images[idx].valid = true;
         s_images[idx].jpeg = NULL;
         s_images[idx].jpeg_len = 0;
-        s_images[idx].width = 0;
-        s_images[idx].height = 0;
         s_images[idx].loaded = false;
         idx++;
     }
@@ -343,42 +342,47 @@ static bool fetch_jpeg_into_buffer(const char *url) {
         .url = url,
         .event_handler = http_collect_event_handler,
         .user_data = &ctx,
-        .timeout_ms = 10000,
-        .buffer_size = 4096,
-        .buffer_size_tx = 4096, // handle long redirect URLs in request line
+        .timeout_ms = 15000,
+        .buffer_size = 2048,
+        .buffer_size_tx = 8192, // handle very long signed URLs
         .cert_pem = CLOUDFLARE_CA_PEM,
         .cert_len = sizeof(CLOUDFLARE_CA_PEM),
+        .keep_alive_enable = false,
+        .disable_auto_redirect = false,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "JPEG fetch failed (%s): %s", url, esp_err_to_name(err));
-        return false;
+    if (err == ESP_OK && status >= 200 && status < 300) {
+        ESP_LOGI(TAG, "JPEG fetched (%d bytes)", jpeg_len);
+        return jpeg_len > 0;
     }
-    ESP_LOGI(TAG, "JPEG fetched (%d bytes)", jpeg_len);
-    return jpeg_len > 0;
+    ESP_LOGE(TAG, "JPEG fetch failed (%s): %s, status=%d", url, esp_err_to_name(err), status);
+    return false;
 }
 
-static bool fetch_and_decode_image(const char *url, uint8_t *decode_buf, size_t decode_buf_size, image_slot_t *slot) {
-    if (!url || !decode_buf || !slot) return false;
-    ESP_LOGI(TAG, "Downloading thumbnail: %s", url);
-    if (!fetch_jpeg_into_buffer(url)) {
-        return false;
-    }
+static bool fetch_and_draw_image(image_slot_t *slot, uint8_t *decode_buf, size_t decode_buf_size) {
+    if (!slot || !slot->valid || !decode_buf) return false;
 
-    // Keep JPEG bytes (small) instead of full RGB frame to save RAM
-    slot->jpeg = heap_caps_malloc(jpeg_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!slot->jpeg) {
-        slot->jpeg = malloc(jpeg_len);
+    // Download once and cache JPEG
+    if (!slot->loaded || !slot->jpeg) {
+        ESP_LOGI(TAG, "Downloading thumbnail: %s", slot->url);
+        if (!fetch_jpeg_into_buffer(slot->url)) {
+            return false;
+        }
+        uint8_t *cpy = heap_caps_malloc(jpeg_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!cpy) cpy = malloc(jpeg_len);
+        if (!cpy) {
+            ESP_LOGE(TAG, "JPEG cache allocation failed");
+            return false;
+        }
+        memcpy(cpy, jpeg_buffer, jpeg_len);
+        slot->jpeg = cpy;
+        slot->jpeg_len = jpeg_len;
+        slot->loaded = true;
     }
-    if (!slot->jpeg) {
-        ESP_LOGE(TAG, "JPEG allocation failed");
-        return false;
-    }
-    memcpy(slot->jpeg, jpeg_buffer, jpeg_len);
-    slot->jpeg_len = jpeg_len;
 
     esp_jpeg_image_cfg_t jpeg_cfg = {
         .indata = slot->jpeg,
@@ -398,14 +402,12 @@ static bool fetch_and_decode_image(const char *url, uint8_t *decode_buf, size_t 
         return false;
     }
 
-    slot->width = outimg.width;
-    slot->height = outimg.height;
-    slot->loaded = true;
-    ESP_LOGI(TAG, "Thumbnail decoded: %dx%d", outimg.width, outimg.height);
+    esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, outimg.width, outimg.height, decode_buf);
+    ESP_LOGI(TAG, "Thumbnail shown: %dx%d", outimg.width, outimg.height);
     return true;
 }
 
-static int download_thumbnails(uint8_t *decode_buf, size_t decode_buf_size) {
+static int load_thumbnail_list(void) {
     if (!s_wifi_connected) {
         ESP_LOGW(TAG, "Skipping downloads; Wi-Fi not connected");
         return 0;
@@ -417,21 +419,11 @@ static int download_thumbnails(uint8_t *decode_buf, size_t decode_buf_size) {
     if (!parse_thumbnail_urls(json_buffer, &found)) {
         return 0;
     }
-
-    int loaded = 0;
-    for (int i = 0; i < found; i++) {
-        if (fetch_and_decode_image(s_images[i].url, decode_buf, decode_buf_size, &s_images[i])) {
-            loaded++;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    ESP_LOGI(TAG, "Loaded %d/%d thumbnails", loaded, found);
-    return loaded;
+    ESP_LOGI(TAG, "Cached %d thumbnail URLs", found);
+    return found;
 }
 
 // --- Display ---
-esp_lcd_panel_handle_t panel_handle = NULL;
-
 void draw_rgb565(uint16_t *pixels, int w, int h) {
     if (w > LCD_H_RES) w = LCD_H_RES; // Crop if necessary
     if (h > LCD_V_RES) h = LCD_V_RES;
@@ -858,29 +850,17 @@ void app_main(void)
     TickType_t last_press_tick_menu = 0;
     bool menu_visible = false;
     int menu_selected = 0;
-    int images_loaded = 0;
+    int images_count = 0;
     if (out_buf) {
-        images_loaded = download_thumbnails(out_buf, out_buf_size);
+        images_count = load_thumbnail_list();
     } else {
         ESP_LOGE(TAG, "No decode buffer available; cannot download thumbnails");
     }
     int current_image = 0;
     TickType_t last_switch_tick = xTaskGetTickCount();
-    if (images_loaded > 0 && s_images[0].loaded) {
-        esp_jpeg_image_cfg_t jpeg_cfg = {
-            .indata = s_images[0].jpeg,
-            .indata_size = s_images[0].jpeg_len,
-            .outbuf = out_buf,
-            .outbuf_size = out_buf_size,
-            .out_format = JPEG_IMAGE_FORMAT_RGB565,
-            .out_scale = JPEG_IMAGE_SCALE_0,
-            .flags = { .swap_color_bytes = 0 }
-        };
-        esp_jpeg_image_output_t outimg;
-        if (esp_jpeg_decode(&jpeg_cfg, &outimg) == ESP_OK) {
-            esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, outimg.width, outimg.height, out_buf);
-        }
-        current_image = (images_loaded > 1) ? 1 : 0;
+    if (images_count > 0 && s_images[0].valid && out_buf) {
+        fetch_and_draw_image(&s_images[0], out_buf, out_buf_size);
+        current_image = (images_count > 1) ? 1 : 0;
         last_switch_tick = xTaskGetTickCount();
     }
     while (1) {
@@ -939,27 +919,15 @@ void app_main(void)
             }
         }
 
-        if (!menu_visible && images_loaded > 0) {
-            if ((now_tick - last_switch_tick) >= pdMS_TO_TICKS(1000)) {
+        if (!menu_visible && images_count > 0) {
+            if ((now_tick - last_switch_tick) >= pdMS_TO_TICKS(5000)) {
                 last_switch_tick = now_tick;
                 image_slot_t *img = &s_images[current_image];
-                if (img->loaded && img->jpeg) {
-                    esp_jpeg_image_cfg_t jpeg_cfg = {
-                        .indata = img->jpeg,
-                        .indata_size = img->jpeg_len,
-                        .outbuf = out_buf,
-                        .outbuf_size = out_buf_size,
-                        .out_format = JPEG_IMAGE_FORMAT_RGB565,
-                        .out_scale = JPEG_IMAGE_SCALE_0,
-                        .flags = { .swap_color_bytes = 0 }
-                    };
-                    esp_jpeg_image_output_t outimg;
-                    if (esp_jpeg_decode(&jpeg_cfg, &outimg) == ESP_OK) {
-                        esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, outimg.width, outimg.height, out_buf);
-                    } else {
-                        ESP_LOGE(TAG, "JPEG decode error on display");
+                if (img->valid && out_buf) {
+                    if (!fetch_and_draw_image(img, out_buf, out_buf_size)) {
+                        ESP_LOGE(TAG, "Failed to display image %d", current_image);
                     }
-                    current_image = (current_image + 1) % images_loaded;
+                    current_image = (current_image + 1) % images_count;
                 }
             }
         } else if (menu_visible) {
