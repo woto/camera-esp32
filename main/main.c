@@ -1,8 +1,12 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
+#include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
@@ -30,7 +34,69 @@
 // --- CONFIG ---
 #define WIFI_SSID      "AndroidAP4484"
 #define WIFI_PASS      "dflg7101"
-#define IMAGE_URL      "https://loremflickr.com/170/320"
+#define API_URL        "https://coordination-zope-counter-newspapers.trycloudflare.com/"
+
+static const char CLOUDFLARE_CA_PEM[] =
+"-----BEGIN CERTIFICATE-----\n"
+"MIIDtjCCA1ygAwIBAgIQCexmoDY34U8OA4t/L2F36jAKBggqhkjOPQQDAjA7MQsw\n"
+"CQYDVQQGEwJVUzEeMBwGA1UEChMVR29vZ2xlIFRydXN0IFNlcnZpY2VzMQwwCgYD\n"
+"VQQDEwNXRTEwHhcNMjUxMjE0MTc1NTM1WhcNMjYwMzE0MTg1NTE4WjAcMRowGAYD\n"
+"VQQDExF0cnljbG91ZGZsYXJlLmNvbTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IA\n"
+"BFHCYvEJFOEfTJDPyKGIexzkq5aJr58B3zjnciufKjZU+l+rwpvszaS99UoQjl+0\n"
+"b+vDNi5MQ+RLpqhy6FTL4fSjggJfMIICWzAOBgNVHQ8BAf8EBAMCB4AwEwYDVR0l\n"
+"BAwwCgYIKwYBBQUHAwEwDAYDVR0TAQH/BAIwADAdBgNVHQ4EFgQUolY55Q7XwP4Q\n"
+"XWPZljNjSCwmaIcwHwYDVR0jBBgwFoAUkHeSNWfE/6jMqeZ72YB5e8yT+TgwXgYI\n"
+"KwYBBQUHAQEEUjBQMCcGCCsGAQUFBzABhhtodHRwOi8vby5wa2kuZ29vZy9zL3dl\n"
+"MS9DZXcwJQYIKwYBBQUHMAKGGWh0dHA6Ly9pLnBraS5nb29nL3dlMS5jcnQwMQYD\n"
+"VR0RBCowKIIRdHJ5Y2xvdWRmbGFyZS5jb22CEyoudHJ5Y2xvdWRmbGFyZS5jb20w\n"
+"EwYDVR0gBAwwCjAIBgZngQwBAgEwNgYDVR0fBC8wLTAroCmgJ4YlaHR0cDovL2Mu\n"
+"cGtpLmdvb2cvd2UxLzBiMDdsS3lTZ1UwLmNybDCCAQQGCisGAQQB1nkCBAIEgfUE\n"
+"gfIA8AB2AMs49xWJfIShRF9bwd37yW7ymlnNRwppBYWwyxTDFFjnAAABmx432nwA\n"
+"AAQDAEcwRQIgWDmZTkbb0FsoAB/N9zdMeyIt/RiutNvkuic/RnQ8DJ4CIQCCkISz\n"
+"uT8M87Je6gzH4N/2WvdbiV52RikykipPpLTjVgB2AA5XlLzzrqk+MxssmQez95Df\n"
+"m8I9cTIl3SGpJaxhxU4hAAABmx432jIAAAQDAEcwRQIgMrW+b9zrfsOa6KXZqdvo\n"
+"zdfq6+S7O11CxXPvagvgvdcCIQDr+xGOZpRDU0jdwlbaH+VBFdFxG6O+9oG0D9ks\n"
+"t6rXTDAKBggqhkjOPQQDAgNIADBFAiEA+NibNwJov0iHz53ikUvVRVDr4KjtDAWN\n"
+"DsHAp2+5+PkCICMUjEQMQXfxNQ07g0u7evuIC9hgB5dHqJrfxO70Fto8\n"
+"-----END CERTIFICATE-----\n"
+"-----BEGIN CERTIFICATE-----\n"
+"MIICnzCCAiWgAwIBAgIQf/MZd5csIkp2FV0TttaF4zAKBggqhkjOPQQDAzBHMQsw\n"
+"CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU\n"
+"MBIGA1UEAxMLR1RTIFJvb3QgUjQwHhcNMjMxMjEzMDkwMDAwWhcNMjkwMjIwMTQw\n"
+"MDAwWjA7MQswCQYDVQQGEwJVUzEeMBwGA1UEChMVR29vZ2xlIFRydXN0IFNlcnZp\n"
+"Y2VzMQwwCgYDVQQDEwNXRTEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARvzTr+\n"
+"Z1dHTCEDhUDCR127WEcPQMFcF4XGGTfn1XzthkubgdnXGhOlCgP4mMTG6J7/EFmP\n"
+"LCaY9eYmJbsPAvpWo4H+MIH7MA4GA1UdDwEB/wQEAwIBhjAdBgNVHSUEDDAKBggr\n"
+"BgEFBQcDAQYIKwYBBQUHAwIwEgYDVR0TAQH/BAgwBgEB/wIBADAdBgNVHQ4EFgQU\n"
+"kHeSNWfE/6jMqeZ72YB5e8yT+TgwHwYDVR0jBBgwFoAUgEzW63T/STaj1dj8tT7F\n"
+"avCUHYwwNAYIKwYBBQUHAQEEKDAmMCQGCCsGAQUFBzAChhhodHRwOi8vaS5wa2ku\n"
+"Z29vZy9yNC5jcnQwKwYDVR0fBCQwIjAgoB6gHIYaaHR0cDovL2MucGtpLmdvb2cv\n"
+"ci9yNC5jcmwwEwYDVR0gBAwwCjAIBgZngQwBAgEwCgYIKoZIzj0EAwMDaAAwZQIx\n"
+"AOcCq1HW90OVznX+0RGU1cxAQXomvtgM8zItPZCuFQ8jSBJSjz5keROv9aYsAm5V\n"
+"sQIwJonMaAFi54mrfhfoFNZEfuNMSQ6/bIBiNLiyoX46FohQvKeIoJ99cx7sUkFN\n"
+"7uJW\n"
+"-----END CERTIFICATE-----\n"
+"-----BEGIN CERTIFICATE-----\n"
+"MIIDejCCAmKgAwIBAgIQf+UwvzMTQ77dghYQST2KGzANBgkqhkiG9w0BAQsFADBX\n"
+"MQswCQYDVQQGEwJCRTEZMBcGA1UEChMQR2xvYmFsU2lnbiBudi1zYTEQMA4GA1UE\n"
+"CxMHUm9vdCBDQTEbMBkGA1UEAxMSR2xvYmFsU2lnbiBSb290IENBMB4XDTIzMTEx\n"
+"NTAzNDMyMVoXDTI4MDEyODAwMDA0MlowRzELMAkGA1UEBhMCVVMxIjAgBgNVBAoT\n"
+"GUdvb2dsZSBUcnVzdCBTZXJ2aWNlcyBMTEMxFDASBgNVBAMTC0dUUyBSb290IFI0\n"
+"MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE83Rzp2iLYK5DuDXFgTB7S0md+8Fhzube\n"
+"Rr1r1WEYNa5A3XP3iZEwWus87oV8okB2O6nGuEfYKueSkWpz6bFyOZ8pn6KY019e\n"
+"WIZlD6GEZQbR3IvJx3PIjGov5cSr0R2Ko4H/MIH8MA4GA1UdDwEB/wQEAwIBhjAd\n"
+"BgNVHSUEFjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwDwYDVR0TAQH/BAUwAwEB/zAd\n"
+"BgNVHQ4EFgQUgEzW63T/STaj1dj8tT7FavCUHYwwHwYDVR0jBBgwFoAUYHtmGkUN\n"
+"l8qJUC99BM00qP/8/UswNgYIKwYBBQUHAQEEKjAoMCYGCCsGAQUFBzAChhpodHRw\n"
+"Oi8vaS5wa2kuZ29vZy9nc3IxLmNydDAtBgNVHR8EJjAkMCKgIKAehhxodHRwOi8v\n"
+"Yy5wa2kuZ29vZy9yL2dzcjEuY3JsMBMGA1UdIAQMMAowCAYGZ4EMAQIBMA0GCSqG\n"
+"SIb3DQEBCwUAA4IBAQAYQrsPBtYDh5bjP2OBDwmkoWhIDDkic574y04tfzHpn+cJ\n"
+"odI2D4SseesQ6bDrarZ7C30ddLibZatoKiws3UL9xnELz4ct92vID24FfVbiI1hY\n"
+"+SW6FoVHkNeWIP0GCbaM4C6uVdF5dTUsMVs/ZbzNnIdCp5Gxmx5ejvEau8otR/Cs\n"
+"kGN+hr/W5GvT1tMBjgWKZ1i4//emhA1JG1BbPzoLJQvyEotc03lXjTaCzv8mEbep\n"
+"8RqZ7a2CPsgRbuvTPBwcOMBBmuFeU88+FSBX6+7iP0il8b4Z0QFqIwwMHfs/L6K1\n"
+"vepuoxtGzi4CZ68zJpiq1UvSqTbFJjtbD4seiMHl\n"
+"-----END CERTIFICATE-----\n";
 
 // Note: Time Sync is handled in main.
 
@@ -59,6 +125,7 @@
 
 #define BUTTON_GPIO 0
 #define BUTTON_GPIO_2 14
+#define BUTTON_DEBOUNCE_MS 250
 
 #define BAT_ADC_UNIT ADC_UNIT_1
 #define BAT_ADC_CHANNEL ADC_CHANNEL_3
@@ -68,15 +135,42 @@
 
 static const char *TAG = "NET-IMG";
 
+
 // --- Wi-Fi ---
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 static EventGroupHandle_t s_wifi_event_group;
 static volatile bool s_wifi_connected = false;
+static QueueHandle_t s_button_queue = NULL;
 
 static adc_oneshot_unit_handle_t s_adc_handle;
 static adc_cali_handle_t s_adc_cali;
 static bool s_adc_cali_enabled = false;
+
+typedef enum {
+    BTN_ID_TRIGGER = BUTTON_GPIO,
+    BTN_ID_MENU = BUTTON_GPIO_2,
+} button_id_t;
+
+typedef struct {
+    button_id_t id;
+    TickType_t tick;
+} button_event_t;
+
+static void IRAM_ATTR button_isr_handler(void *arg) {
+    button_id_t btn = (button_id_t)(int)arg;
+    button_event_t evt = {
+        .id = btn,
+        .tick = xTaskGetTickCountFromISR(),
+    };
+    BaseType_t hp_task_woken = pdFALSE;
+    if (s_button_queue) {
+        xQueueSendFromISR(s_button_queue, &evt, &hp_task_woken);
+    }
+    if (hp_task_woken) {
+        portYIELD_FROM_ISR();
+    }
+}
 
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
@@ -118,47 +212,221 @@ void wifi_init_sta(void) {
 }
 
 // --- HTTP & Image ---
-
-// --- HTTP & Image ---
 #define MAX_JPEG_SIZE (80 * 1024)
+#define JSON_BUFFER_SIZE 4096
+#define MAX_IMAGES 8
+#define MAX_URL_LEN 256
+
+typedef struct {
+    uint8_t *buf;
+    int max_len;
+    int *out_len;
+} http_buffer_ctx_t;
+
+typedef struct {
+    char url[MAX_URL_LEN];
+    uint8_t *jpeg;
+    int jpeg_len;
+    int width;
+    int height;
+    bool loaded;
+} image_slot_t;
+
 static char *jpeg_buffer = NULL;
 static int jpeg_len = 0;
+static char json_buffer[JSON_BUFFER_SIZE];
+static image_slot_t s_images[MAX_IMAGES];
 
-esp_err_t _http_event_handler(esp_http_client_event_t *evt) {
-    switch(evt->event_id) {
-        case HTTP_EVENT_ON_DATA:
-            if (jpeg_len + evt->data_len < MAX_JPEG_SIZE) {
-                memcpy(jpeg_buffer + jpeg_len, evt->data, evt->data_len);
-                jpeg_len += evt->data_len;
-            }
-            break;
-        default: break;
+static esp_err_t http_collect_event_handler(esp_http_client_event_t *evt) {
+    http_buffer_ctx_t *ctx = (http_buffer_ctx_t *)evt->user_data;
+    if (!ctx || !ctx->buf || !ctx->out_len) {
+        return ESP_OK;
+    }
+    if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        int remaining = ctx->max_len - *(ctx->out_len);
+        int to_copy = evt->data_len < remaining ? evt->data_len : remaining;
+        if (to_copy > 0) {
+            memcpy(ctx->buf + *(ctx->out_len), evt->data, to_copy);
+            *(ctx->out_len) += to_copy;
+        }
     }
     return ESP_OK;
 }
 
-void fetch_image() {
-    ESP_LOGI(TAG, "Fetching image...");
-    jpeg_len = 0;
-    
+static bool fetch_json_feed(void) {
+    memset(json_buffer, 0, sizeof(json_buffer));
+    int json_len = 0;
+    http_buffer_ctx_t ctx = {
+        .buf = (uint8_t *)json_buffer,
+        .max_len = JSON_BUFFER_SIZE - 1,
+        .out_len = &json_len,
+    };
     esp_http_client_config_t config = {
-        .url = IMAGE_URL,
-        .event_handler = _http_event_handler,
+        .url = API_URL,
+        .event_handler = http_collect_event_handler,
+        .user_data = &ctx,
+        .timeout_ms = 10000,
+        .buffer_size = 2048,
+        .buffer_size_tx = 4096, // long signed URLs can exceed default tx buffer
+        .cert_pem = CLOUDFLARE_CA_PEM,
+        .cert_len = sizeof(CLOUDFLARE_CA_PEM),
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "Accept", "application/json");
+    esp_err_t err = esp_http_client_perform(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "JSON fetch failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    ESP_LOGI(TAG, "JSON fetched (%d bytes)", json_len);
+    return json_len > 0;
+}
+
+static bool parse_thumbnail_urls(const char *json, int *out_count) {
+    if (!json || !out_count) return false;
+    *out_count = 0;
+
+    cJSON *root = cJSON_Parse(json);
+    if (!root) {
+        ESP_LOGE(TAG, "JSON parse error");
+        return false;
+    }
+
+    cJSON *thumbs = cJSON_GetObjectItem(root, "thumbnails");
+    if (!cJSON_IsArray(thumbs)) {
+        ESP_LOGW(TAG, "No thumbnails array in JSON");
+        cJSON_Delete(root);
+        return false;
+    }
+
+    int idx = 0;
+    cJSON *thumb = NULL;
+    cJSON_ArrayForEach(thumb, thumbs) {
+        if (idx >= MAX_IMAGES) break;
+        cJSON *url = cJSON_GetObjectItem(thumb, "url");
+        if (!cJSON_IsString(url) || !url->valuestring) {
+            continue;
+        }
+        size_t len = strnlen(url->valuestring, MAX_URL_LEN - 1);
+        memset(&s_images[idx], 0, sizeof(image_slot_t));
+        memcpy(s_images[idx].url, url->valuestring, len);
+        s_images[idx].url[len] = '\0';
+        s_images[idx].jpeg = NULL;
+        s_images[idx].jpeg_len = 0;
+        s_images[idx].width = 0;
+        s_images[idx].height = 0;
+        s_images[idx].loaded = false;
+        idx++;
+    }
+
+    cJSON_Delete(root);
+    *out_count = idx;
+    if (idx == 0) {
+        ESP_LOGW(TAG, "No valid thumbnail URLs found");
+        return false;
+    }
+    ESP_LOGI(TAG, "Found %d thumbnails", idx);
+    return true;
+}
+
+static bool fetch_jpeg_into_buffer(const char *url) {
+    if (!url || !jpeg_buffer) return false;
+    jpeg_len = 0;
+    http_buffer_ctx_t ctx = {
+        .buf = (uint8_t *)jpeg_buffer,
+        .max_len = MAX_JPEG_SIZE,
+        .out_len = &jpeg_len,
+    };
+    esp_http_client_config_t config = {
+        .url = url,
+        .event_handler = http_collect_event_handler,
+        .user_data = &ctx,
         .timeout_ms = 10000,
         .buffer_size = 4096,
-        .crt_bundle_attach = esp_crt_bundle_attach,
+        .buffer_size_tx = 4096, // handle long redirect URLs in request line
+        .cert_pem = CLOUDFLARE_CA_PEM,
+        .cert_len = sizeof(CLOUDFLARE_CA_PEM),
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_err_t err = esp_http_client_perform(client);
-
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "HTTP Local Status = %d, content_length = %d",
-                esp_http_client_get_status_code(client),
-                (int)esp_http_client_get_content_length(client));
-    } else {
-        ESP_LOGE(TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
-    }
     esp_http_client_cleanup(client);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "JPEG fetch failed (%s): %s", url, esp_err_to_name(err));
+        return false;
+    }
+    ESP_LOGI(TAG, "JPEG fetched (%d bytes)", jpeg_len);
+    return jpeg_len > 0;
+}
+
+static bool fetch_and_decode_image(const char *url, uint8_t *decode_buf, size_t decode_buf_size, image_slot_t *slot) {
+    if (!url || !decode_buf || !slot) return false;
+    ESP_LOGI(TAG, "Downloading thumbnail: %s", url);
+    if (!fetch_jpeg_into_buffer(url)) {
+        return false;
+    }
+
+    // Keep JPEG bytes (small) instead of full RGB frame to save RAM
+    slot->jpeg = heap_caps_malloc(jpeg_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!slot->jpeg) {
+        slot->jpeg = malloc(jpeg_len);
+    }
+    if (!slot->jpeg) {
+        ESP_LOGE(TAG, "JPEG allocation failed");
+        return false;
+    }
+    memcpy(slot->jpeg, jpeg_buffer, jpeg_len);
+    slot->jpeg_len = jpeg_len;
+
+    esp_jpeg_image_cfg_t jpeg_cfg = {
+        .indata = slot->jpeg,
+        .indata_size = slot->jpeg_len,
+        .outbuf = decode_buf,
+        .outbuf_size = decode_buf_size,
+        .out_format = JPEG_IMAGE_FORMAT_RGB565,
+        .out_scale = JPEG_IMAGE_SCALE_0,
+        .flags = {
+            .swap_color_bytes = 0,
+        }
+    };
+    esp_jpeg_image_output_t outimg;
+    esp_err_t res = esp_jpeg_decode(&jpeg_cfg, &outimg);
+    if (res != ESP_OK) {
+        ESP_LOGE(TAG, "JPEG decode error: %d", res);
+        return false;
+    }
+
+    slot->width = outimg.width;
+    slot->height = outimg.height;
+    slot->loaded = true;
+    ESP_LOGI(TAG, "Thumbnail decoded: %dx%d", outimg.width, outimg.height);
+    return true;
+}
+
+static int download_thumbnails(uint8_t *decode_buf, size_t decode_buf_size) {
+    if (!s_wifi_connected) {
+        ESP_LOGW(TAG, "Skipping downloads; Wi-Fi not connected");
+        return 0;
+    }
+    if (!fetch_json_feed()) {
+        return 0;
+    }
+    int found = 0;
+    if (!parse_thumbnail_urls(json_buffer, &found)) {
+        return 0;
+    }
+
+    int loaded = 0;
+    for (int i = 0; i < found; i++) {
+        if (fetch_and_decode_image(s_images[i].url, decode_buf, decode_buf_size, &s_images[i])) {
+            loaded++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGI(TAG, "Loaded %d/%d thumbnails", loaded, found);
+    return loaded;
 }
 
 // --- Display ---
@@ -527,7 +795,8 @@ void app_main(void)
     // JPEG Output buffer
     // RGB565 = 2 bytes per pixel
     size_t out_buf_size = LCD_H_RES * LCD_V_RES * 2;
-    uint8_t *out_buf = heap_caps_malloc(out_buf_size, MALLOC_CAP_DMA);
+    uint8_t *out_buf = heap_caps_malloc(out_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!out_buf) out_buf = heap_caps_malloc(out_buf_size, MALLOC_CAP_DMA);
     if (!out_buf) out_buf = malloc(out_buf_size);
 
     if (out_buf) {
@@ -571,111 +840,132 @@ void app_main(void)
     ESP_LOGI(TAG, "Time Set: %s", asctime(&timeinfo));
 
     // --- Button Init ---
+    s_button_queue = xQueueCreate(10, sizeof(button_event_t));
     gpio_config_t btn_conf = {
         .pin_bit_mask = (1ULL << BUTTON_GPIO) | (1ULL << BUTTON_GPIO_2),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE, // Buttons are usually active low
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
     };
     gpio_config(&btn_conf);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add((gpio_num_t)BUTTON_GPIO, button_isr_handler, (void *)BUTTON_GPIO);
+    gpio_isr_handler_add((gpio_num_t)BUTTON_GPIO_2, button_isr_handler, (void *)BUTTON_GPIO_2);
 
     // --- Loop ---
-    int image_timer = 0;
+    TickType_t last_press_tick_trigger = 0;
+    TickType_t last_press_tick_menu = 0;
     bool menu_visible = false;
     int menu_selected = 0;
-    int last_btn_trigger = 1;
-    int last_btn_menu = 1;
-    TickType_t last_press_trigger = 0;
-    TickType_t last_press_menu = 0;
+    int images_loaded = 0;
+    if (out_buf) {
+        images_loaded = download_thumbnails(out_buf, out_buf_size);
+    } else {
+        ESP_LOGE(TAG, "No decode buffer available; cannot download thumbnails");
+    }
+    int current_image = 0;
+    TickType_t last_switch_tick = xTaskGetTickCount();
+    if (images_loaded > 0 && s_images[0].loaded) {
+        esp_jpeg_image_cfg_t jpeg_cfg = {
+            .indata = s_images[0].jpeg,
+            .indata_size = s_images[0].jpeg_len,
+            .outbuf = out_buf,
+            .outbuf_size = out_buf_size,
+            .out_format = JPEG_IMAGE_FORMAT_RGB565,
+            .out_scale = JPEG_IMAGE_SCALE_0,
+            .flags = { .swap_color_bytes = 0 }
+        };
+        esp_jpeg_image_output_t outimg;
+        if (esp_jpeg_decode(&jpeg_cfg, &outimg) == ESP_OK) {
+            esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, outimg.width, outimg.height, out_buf);
+        }
+        current_image = (images_loaded > 1) ? 1 : 0;
+        last_switch_tick = xTaskGetTickCount();
+    }
     while (1) {
-        int btn_trigger = gpio_get_level(BUTTON_GPIO);
-        int btn_menu = gpio_get_level(BUTTON_GPIO_2);
         TickType_t now_tick = xTaskGetTickCount();
-        if (last_btn_menu == 1 && btn_menu == 0 && (now_tick - last_press_menu) > pdMS_TO_TICKS(250)) {
-            last_press_menu = now_tick;
-            if (!menu_visible) {
-                menu_visible = true;
-                menu_selected = 0;
-                lcd_render_menu(panel_handle, (uint16_t *)out_buf, menu_selected, read_battery_voltage_mv());
-            } else {
-                menu_selected++;
-                if (menu_selected >= MENU_ITEMS) {
-                    menu_visible = false;
-                    lcd_fill_color(panel_handle, (uint16_t *)out_buf, 0x0000);
-                } else {
+        button_event_t evt;
+        while (xQueueReceive(s_button_queue, &evt, 0) == pdTRUE) {
+            TickType_t *last_tick = (evt.id == BTN_ID_MENU) ? &last_press_tick_menu : &last_press_tick_trigger;
+            if ((evt.tick - *last_tick) < pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS)) {
+                continue;
+            }
+            *last_tick = evt.tick;
+
+            if (evt.id == BTN_ID_MENU) {
+                if (!out_buf) {
+                    ESP_LOGE(TAG, "Menu buffer not available");
+                    continue;
+                }
+                if (!menu_visible) {
+                    menu_visible = true;
+                    menu_selected = 0;
                     lcd_render_menu(panel_handle, (uint16_t *)out_buf, menu_selected, read_battery_voltage_mv());
-                }
-            }
-        }
-
-        if (last_btn_trigger == 1 && btn_trigger == 0 && (now_tick - last_press_trigger) > pdMS_TO_TICKS(250)) {
-            last_press_trigger = now_tick;
-            if (menu_visible) {
-                if (menu_selected == MENU_ITEM_POWER) {
-                    enter_deep_sleep();
-                }
-            } else {
-                ESP_LOGI(TAG, "Button 0 Pressed! Sending Trigger...");
-
-                esp_http_client_config_t config_post = {
-                    .url = "http://chemical-topics-steady-morris.trycloudflare.com/recorder/trigger",
-                    .method = HTTP_METHOD_POST,
-                    .timeout_ms = 10000,
-                    .crt_bundle_attach = esp_crt_bundle_attach,
-                };
-                esp_http_client_handle_t client_post = esp_http_client_init(&config_post);
-                esp_http_client_perform(client_post);
-                esp_http_client_cleanup(client_post);
-
-                ESP_LOGI(TAG, "Trigger Sent.");
-            }
-        }
-        last_btn_trigger = btn_trigger;
-        last_btn_menu = btn_menu;
-
-        // Periodic Image Fetch (every ~5 seconds)
-        if (!menu_visible && image_timer++ > 50) { // 50 * 100ms = 5000ms
-            image_timer = 0;
-            if (s_wifi_connected) {
-                fetch_image();
-            } else {
-                ESP_LOGW(TAG, "Skipping fetch; Wi-Fi not connected");
-            }
-
-            if (jpeg_len > 0) {
-                ESP_LOGI(TAG, "Decoding JPEG (%d bytes)...", jpeg_len);
-                
-                esp_jpeg_image_cfg_t jpeg_cfg = {
-                    .indata = (uint8_t*)jpeg_buffer,
-                    .indata_size = jpeg_len,
-                    .outbuf = out_buf,
-                    .outbuf_size = out_buf_size,
-                    .out_format = JPEG_IMAGE_FORMAT_RGB565,
-                    .out_scale = JPEG_IMAGE_SCALE_0,
-                    .flags = {
-                        .swap_color_bytes = 0,
-                    }
-                };
-                esp_jpeg_image_output_t outimg;
-                
-                esp_err_t res = esp_jpeg_decode(&jpeg_cfg, &outimg);
-                if (res == ESP_OK) {
-                    ESP_LOGI(TAG, "Decoded: %dx%d", outimg.width, outimg.height);
-                    esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, outimg.width, outimg.height, (uint16_t*)out_buf);
                 } else {
-                    ESP_LOGE(TAG, "JPEG Decode Error: %d", res);
-                    if (out_buf) {
-                        lcd_fill_color(panel_handle, (uint16_t *)out_buf, 0xFFFF);
+                    menu_selected++;
+                    if (menu_selected >= MENU_ITEMS) {
+                        menu_visible = false;
+                        lcd_fill_color(panel_handle, (uint16_t *)out_buf, 0x0000);
+                    } else {
+                        lcd_render_menu(panel_handle, (uint16_t *)out_buf, menu_selected, read_battery_voltage_mv());
                     }
                 }
-            } else if (out_buf && s_wifi_connected) {
-                lcd_fill_color(panel_handle, (uint16_t *)out_buf, 0xFFFF);
+            } else if (evt.id == BTN_ID_TRIGGER) {
+                if (menu_visible) {
+                    if (menu_selected == MENU_ITEM_POWER) {
+                        enter_deep_sleep();
+                    }
+                } else {
+                    ESP_LOGI(TAG, "Button 0 Pressed! Sending Trigger...");
+
+                    esp_http_client_config_t config_post = {
+                        .url = "https://coordination-zope-counter-newspapers.trycloudflare.com/recorder/trigger",
+                        .method = HTTP_METHOD_POST,
+                        .timeout_ms = 10000,
+                        .cert_pem = CLOUDFLARE_CA_PEM,
+                        .cert_len = sizeof(CLOUDFLARE_CA_PEM),
+                    };
+                    esp_http_client_handle_t client_post = esp_http_client_init(&config_post);
+                    esp_err_t post_err = esp_http_client_perform(client_post);
+                    esp_http_client_cleanup(client_post);
+
+                    if (post_err == ESP_OK) {
+                        ESP_LOGI(TAG, "Trigger Sent.");
+                    } else {
+                        ESP_LOGE(TAG, "Trigger Failed: %s", esp_err_to_name(post_err));
+                    }
+                }
+            }
+        }
+
+        if (!menu_visible && images_loaded > 0) {
+            if ((now_tick - last_switch_tick) >= pdMS_TO_TICKS(1000)) {
+                last_switch_tick = now_tick;
+                image_slot_t *img = &s_images[current_image];
+                if (img->loaded && img->jpeg) {
+                    esp_jpeg_image_cfg_t jpeg_cfg = {
+                        .indata = img->jpeg,
+                        .indata_size = img->jpeg_len,
+                        .outbuf = out_buf,
+                        .outbuf_size = out_buf_size,
+                        .out_format = JPEG_IMAGE_FORMAT_RGB565,
+                        .out_scale = JPEG_IMAGE_SCALE_0,
+                        .flags = { .swap_color_bytes = 0 }
+                    };
+                    esp_jpeg_image_output_t outimg;
+                    if (esp_jpeg_decode(&jpeg_cfg, &outimg) == ESP_OK) {
+                        esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, outimg.width, outimg.height, out_buf);
+                    } else {
+                        ESP_LOGE(TAG, "JPEG decode error on display");
+                    }
+                    current_image = (current_image + 1) % images_loaded;
+                }
             }
         } else if (menu_visible) {
-            image_timer = 0;
+            last_switch_tick = now_tick;
         }
-        
-        vTaskDelay(pdMS_TO_TICKS(100)); // Check button every 100ms
+
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
