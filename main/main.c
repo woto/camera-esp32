@@ -27,6 +27,7 @@
 #include "esp_lcd_io_i80.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_attr.h"
 
 // JPEG Decoder
 #include "jpeg_decoder.h"
@@ -34,7 +35,7 @@
 // --- CONFIG ---
 #define WIFI_SSID      "AndroidAP4484"
 #define WIFI_PASS      "dflg7101"
-#define API_URL        "https://coordination-zope-counter-newspapers.trycloudflare.com/"
+#define API_URL        "https://camera.boxhoster.com/"
 
 static const char CLOUDFLARE_CA_PEM[] =
 "-----BEGIN CERTIFICATE-----\n"
@@ -122,10 +123,13 @@ static const char CLOUDFLARE_CA_PEM[] =
 #define LCD_X_OFFSET 35
 #define LCD_Y_OFFSET 0
 #define LCD_PIXEL_CLOCK_HZ (20 * 1000 * 1000)
+#define LCD_DMA_ALIGN 16
+#define LCD_DMA_CHUNK_BYTES 4080
 
 #define BUTTON_GPIO 0
 #define BUTTON_GPIO_2 14
 #define BUTTON_DEBOUNCE_MS 250
+#define IMAGE_ROTATION_INTERVAL_MS 1000
 
 #define BAT_ADC_UNIT ADC_UNIT_1
 #define BAT_ADC_CHANNEL ADC_CHANNEL_3
@@ -215,7 +219,7 @@ void wifi_init_sta(void) {
 
 // --- HTTP & Image ---
 #define MAX_JPEG_SIZE (32 * 1024)
-#define JSON_BUFFER_SIZE 4096
+#define JSON_BUFFER_SIZE 65536
 #define MAX_IMAGES 32
 #define MAX_URL_LEN 256
 
@@ -235,9 +239,87 @@ typedef struct {
 
 static char *jpeg_buffer = NULL;
 static int jpeg_len = 0;
-static char json_buffer[JSON_BUFFER_SIZE];
+static char *json_buffer = NULL; // allocated on demand; prefer PSRAM when available
 static image_slot_t s_images[MAX_IMAGES];
 static esp_lcd_panel_handle_t panel_handle = NULL;
+// Two chunk buffers for ping-pong, so we never overwrite a buffer while a DMA transfer is still in flight.
+static DMA_ATTR uint16_t s_chunk_buf[2][LCD_DMA_CHUNK_BYTES / sizeof(uint16_t)] __attribute__((aligned(LCD_DMA_ALIGN)));
+
+// Forward declarations for helpers used before definition
+static void lcd_fill_color(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, uint16_t color);
+static void framebuf_fill_color(uint16_t *frame_buf, uint16_t color);
+
+static int calc_chunk_rows(int width_pixels) {
+    size_t row_bytes = (size_t)width_pixels * sizeof(uint16_t);
+    int rows = LCD_DMA_CHUNK_BYTES / row_bytes;
+    if (rows < 1) {
+        rows = 1;
+    }
+    while ((row_bytes * rows) % LCD_DMA_ALIGN != 0 && rows > 1) {
+        rows--;
+    }
+    return rows;
+}
+
+static bool panel_draw_bitmap_chunked(const uint16_t *buf, int buf_width, int buf_height) {
+    if (!panel_handle || !buf) {
+        return false;
+    }
+    int buf_select = 0; // ping-pong between the two chunk buffers
+    int draw_w = buf_width > LCD_H_RES ? LCD_H_RES : buf_width;
+    int draw_h = buf_height > LCD_V_RES ? LCD_V_RES : buf_height;
+    int rows_per_chunk = calc_chunk_rows(draw_w);
+    if (rows_per_chunk < 1) {
+        rows_per_chunk = 1;
+    }
+    int max_rows_in_buf = (int)(sizeof(s_chunk_buf) / sizeof(s_chunk_buf[0]) / draw_w);
+    if (max_rows_in_buf < 1) {
+        max_rows_in_buf = 1;
+    }
+    if (rows_per_chunk > max_rows_in_buf) {
+        rows_per_chunk = max_rows_in_buf;
+    }
+
+    esp_err_t err = ESP_OK;
+    for (int y = 0; y < draw_h && err == ESP_OK; y += rows_per_chunk) {
+        int h = rows_per_chunk;
+        if (y + h > draw_h) {
+            h = draw_h - y;
+        }
+        const uint16_t *row = buf + (y * buf_width);
+        for (int r = 0; r < h; r++) {
+            memcpy(&s_chunk_buf[buf_select][r * draw_w], row + r * buf_width, draw_w * sizeof(uint16_t));
+        }
+        err = esp_lcd_panel_draw_bitmap(panel_handle, 0, y, draw_w, y + h, s_chunk_buf[buf_select]);
+        buf_select ^= 1; // switch buffer for next chunk
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Draw bitmap failed: %s", esp_err_to_name(err));
+    }
+    return err == ESP_OK;
+}
+
+static bool allocate_json_buffer(void) {
+    if (json_buffer) {
+        return true;
+    }
+    json_buffer = heap_caps_malloc(JSON_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!json_buffer) {
+        json_buffer = malloc(JSON_BUFFER_SIZE);
+    }
+    if (!json_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate JSON buffer (%d bytes)", JSON_BUFFER_SIZE);
+        return false;
+    }
+    return true;
+}
+
+static void free_json_buffer(void) {
+    if (json_buffer) {
+        free(json_buffer);
+        json_buffer = NULL;
+    }
+}
 
 static esp_err_t http_collect_event_handler(esp_http_client_event_t *evt) {
     http_buffer_ctx_t *ctx = (http_buffer_ctx_t *)evt->user_data;
@@ -254,7 +336,10 @@ static esp_err_t http_collect_event_handler(esp_http_client_event_t *evt) {
 }
 
 static bool fetch_json_feed(void) {
-    memset(json_buffer, 0, sizeof(json_buffer));
+    if (!allocate_json_buffer()) {
+        return false;
+    }
+    memset(json_buffer, 0, JSON_BUFFER_SIZE);
     int json_len = 0;
     http_buffer_ctx_t ctx = {
         .buf = (uint8_t *)json_buffer,
@@ -279,6 +364,9 @@ static bool fetch_json_feed(void) {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "JSON fetch failed: %s", esp_err_to_name(err));
         return false;
+    }
+    if (json_len >= JSON_BUFFER_SIZE - 1) {
+        ESP_LOGW(TAG, "JSON may be truncated (buffer %d bytes); consider increasing JSON_BUFFER_SIZE", JSON_BUFFER_SIZE);
     }
     ESP_LOGI(TAG, "JSON fetched (%d bytes)", json_len);
     return json_len > 0;
@@ -384,6 +472,11 @@ static bool fetch_and_draw_image(image_slot_t *slot, uint8_t *decode_buf, size_t
         slot->loaded = true;
     }
 
+    // Clear working buffer only (do not push to panel) to avoid visible black flash between images.
+    if (decode_buf_size >= (size_t)LCD_H_RES * (size_t)LCD_V_RES * 2) {
+        framebuf_fill_color((uint16_t *)decode_buf, 0x0000);
+    }
+
     esp_jpeg_image_cfg_t jpeg_cfg = {
         .indata = slot->jpeg,
         .indata_size = slot->jpeg_len,
@@ -402,9 +495,11 @@ static bool fetch_and_draw_image(image_slot_t *slot, uint8_t *decode_buf, size_t
         return false;
     }
 
-    esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, outimg.width, outimg.height, decode_buf);
-    ESP_LOGI(TAG, "Thumbnail shown: %dx%d", outimg.width, outimg.height);
-    return true;
+    bool ok = panel_draw_bitmap_chunked((uint16_t *)decode_buf, outimg.width, outimg.height);
+    if (ok) {
+        ESP_LOGI(TAG, "Thumbnail shown: %dx%d", outimg.width, outimg.height);
+    }
+    return ok;
 }
 
 static int load_thumbnail_list(void) {
@@ -413,12 +508,15 @@ static int load_thumbnail_list(void) {
         return 0;
     }
     if (!fetch_json_feed()) {
+        free_json_buffer();
         return 0;
     }
     int found = 0;
     if (!parse_thumbnail_urls(json_buffer, &found)) {
+        free_json_buffer();
         return 0;
     }
+    free_json_buffer(); // release heap before allocating large decode buffers
     ESP_LOGI(TAG, "Cached %d thumbnail URLs", found);
     return found;
 }
@@ -435,15 +533,16 @@ void draw_rgb565(uint16_t *pixels, int w, int h) {
     for (int i=0; i<w*h; i++) {
         pixels[i] = (pixels[i] >> 8) | (pixels[i] << 8);
     }
-    esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, w, h, pixels);
+    panel_draw_bitmap_chunked(pixels, w, h);
 }
 
 static void lcd_fill_color(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, uint16_t color) {
+    (void)panel;
     size_t pixel_count = (size_t)LCD_H_RES * (size_t)LCD_V_RES;
     for (size_t i = 0; i < pixel_count; i++) {
         frame_buf[i] = color;
     }
-    esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, frame_buf);
+    panel_draw_bitmap_chunked(frame_buf, LCD_H_RES, LCD_V_RES);
 }
 
 #define FONT_FIRST_CHAR 32
@@ -547,6 +646,32 @@ static void lcd_draw_text(uint16_t *frame_buf, int x, int y, const char *text, u
     }
 }
 
+static int lcd_text_width_px(const char *text) {
+    if (!text) return 0;
+    size_t len = strnlen(text, 64);
+    return (int)len * (FONT_WIDTH + 1) * FONT_SCALE;
+}
+
+static void lcd_show_status_screen(uint16_t *frame_buf, const char *line1, const char *line2, uint16_t bg_color, uint16_t fg_color) {
+    if (!frame_buf || !panel_handle) return;
+    framebuf_fill_color(frame_buf, bg_color);
+    int y = (LCD_V_RES / 2) - (FONT_HEIGHT * FONT_SCALE);
+    if (line1) {
+        int x = (LCD_H_RES - lcd_text_width_px(line1)) / 2;
+        if (x < 0) x = 0;
+        lcd_draw_text(frame_buf, x, y, line1, fg_color);
+    }
+    if (line2) {
+        int x = (LCD_H_RES - lcd_text_width_px(line2)) / 2;
+        if (x < 0) x = 0;
+        lcd_draw_text(frame_buf, x, y + FONT_HEIGHT * FONT_SCALE + 10, line2, fg_color);
+    }
+    panel_draw_bitmap_chunked(frame_buf, LCD_H_RES, LCD_V_RES);
+    if (PIN_NUM_BL >= 0) {
+        gpio_set_level((gpio_num_t)PIN_NUM_BL, 1);
+    }
+}
+
 #define MENU_ITEMS 4
 #define MENU_ITEM_POWER 3
 
@@ -571,6 +696,7 @@ static void lcd_draw_rect_outline(uint16_t *frame_buf, int x, int y, int w, int 
 }
 
 static void lcd_render_menu(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, int selected, int bat_mv) {
+    (void)panel;
     if (!frame_buf) return;
     framebuf_fill_color(frame_buf, 0x0000);
     const int box_w = LCD_H_RES - 30;
@@ -602,7 +728,7 @@ static void lcd_render_menu(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, i
             lcd_draw_text(frame_buf, start_x + 10, y + 12, labels[i], 0xFFFF);
         }
     }
-    esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, frame_buf);
+    panel_draw_bitmap_chunked(frame_buf, LCD_H_RES, LCD_V_RES);
 }
 
 static void enter_deep_sleep(void) {
@@ -712,6 +838,8 @@ void app_main(void)
     // GPIO Hold Dis
     if (PIN_NUM_BL >= 0) {
         gpio_hold_dis((gpio_num_t)PIN_NUM_BL);
+        gpio_set_direction((gpio_num_t)PIN_NUM_BL, GPIO_MODE_OUTPUT);
+        gpio_set_level((gpio_num_t)PIN_NUM_BL, 0); // Keep backlight off until first clear
     }
 
     if (PIN_NUM_PWR >= 0) {
@@ -747,7 +875,8 @@ void app_main(void)
         .pclk_hz = LCD_PIXEL_CLOCK_HZ,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
-        .trans_queue_depth = 10,
+        // Keep queue depth at 1 so transfers finish before we reuse the same DMA buffer.
+        .trans_queue_depth = 1,
         .dc_levels = {
             .dc_idle_level = 0,
             .dc_cmd_level = 0,
@@ -773,32 +902,26 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
 
     // Backlight ON
-    if (PIN_NUM_BL >= 0) {
-        gpio_set_direction((gpio_num_t)PIN_NUM_BL, GPIO_MODE_OUTPUT);
-        gpio_set_level((gpio_num_t)PIN_NUM_BL, 1);
+    // Will be enabled after first explicit screen clear
+    size_t out_buf_size = LCD_H_RES * LCD_V_RES * 2;
+    uint8_t *out_buf = esp_lcd_i80_alloc_draw_buffer(io_handle, out_buf_size, MALLOC_CAP_SPIRAM);
+    if (!out_buf) {
+        out_buf = esp_lcd_i80_alloc_draw_buffer(io_handle, out_buf_size, MALLOC_CAP_INTERNAL);
+    }
+    if (out_buf) {
+        lcd_show_status_screen((uint16_t *)out_buf, "BOOTING", "Initializing display", 0x0000, 0xFFFF);
+    } else {
+        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        ESP_LOGE(TAG, "No decode buffer available; largest free block: %lu bytes", (unsigned long)largest);
     }
 
     init_battery_adc();
 
-    // --- Buffers ---
-    jpeg_buffer = heap_caps_malloc(MAX_JPEG_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!jpeg_buffer) jpeg_buffer = malloc(MAX_JPEG_SIZE); // Fallback to internal RAM
-
-    // JPEG Output buffer
-    // RGB565 = 2 bytes per pixel
-    size_t out_buf_size = LCD_H_RES * LCD_V_RES * 2;
-    uint8_t *out_buf = heap_caps_malloc(out_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!out_buf) out_buf = heap_caps_malloc(out_buf_size, MALLOC_CAP_DMA);
-    if (!out_buf) out_buf = malloc(out_buf_size);
-
-    if (out_buf) {
-        lcd_fill_color(panel_handle, (uint16_t *)out_buf, 0xFFFF);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        lcd_fill_color(panel_handle, (uint16_t *)out_buf, 0x0000);
-    }
-
     // --- Wifi ---
     ESP_LOGI(TAG, "Connecting to Wi-Fi...");
+    if (out_buf) {
+        lcd_show_status_screen((uint16_t *)out_buf, "Wi-Fi", "Connecting...", 0x0000, 0xFFFF);
+    }
     wifi_init_sta();
     EventBits_t wifi_bits = xEventGroupWaitBits(
         s_wifi_event_group,
@@ -809,27 +932,43 @@ void app_main(void)
     );
     if (wifi_bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "Wi-Fi Connected");
+        if (out_buf) {
+            lcd_show_status_screen((uint16_t *)out_buf, "Wi-Fi OK", WIFI_SSID, 0x0000, 0x07E0);
+        }
     } else {
         ESP_LOGW(TAG, "Wi-Fi connect timeout, continuing without connection");
+        if (out_buf) {
+            lcd_show_status_screen((uint16_t *)out_buf, "Wi-Fi timeout", "Continuing offline", 0x0000, 0xF800);
+        }
     }
 
     // --- SNTP Time Sync ---
     ESP_LOGI(TAG, "Initializing SNTP");
-    sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "pool.ntp.org");
-    sntp_init();
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+    if (out_buf) {
+        lcd_show_status_screen((uint16_t *)out_buf, "Time sync", "Waiting for SNTP...", 0x0000, 0xFFFF);
+    }
 
     int retry = 0;
-    const int retry_count = 20;
+    const int retry_count = 10; // limit blocking time during boot
     while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && ++retry < retry_count) {
         ESP_LOGI(TAG, "Waiting for system time to be set... (%d/%d) Status: %d", retry, retry_count, sntp_get_sync_status());
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
     time_t now;
     struct tm timeinfo;
     time(&now);
     localtime_r(&now, &timeinfo);
     ESP_LOGI(TAG, "Time Set: %s", asctime(&timeinfo));
+    if (out_buf) {
+        if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+            lcd_show_status_screen((uint16_t *)out_buf, "Time OK", "Continuing...", 0x0000, 0x07E0);
+        } else {
+            lcd_show_status_screen((uint16_t *)out_buf, "Time sync timeout", "TLS may fail", 0x0000, 0xF800);
+        }
+    }
 
     // --- Button Init ---
     s_button_queue = xQueueCreate(10, sizeof(button_event_t));
@@ -845,18 +984,31 @@ void app_main(void)
     gpio_isr_handler_add((gpio_num_t)BUTTON_GPIO, button_isr_handler, (void *)BUTTON_GPIO);
     gpio_isr_handler_add((gpio_num_t)BUTTON_GPIO_2, button_isr_handler, (void *)BUTTON_GPIO_2);
 
+    // Fetch JSON list before allocating large decode buffers to keep heap available for TLS
+    if (out_buf) {
+        if (s_wifi_connected) {
+            lcd_show_status_screen((uint16_t *)out_buf, "Loading feed", "Fetching thumbnails...", 0x0000, 0xFFFF);
+        } else {
+            lcd_show_status_screen((uint16_t *)out_buf, "Offline mode", "No Wi-Fi connection", 0x0000, 0xFFFF);
+        }
+    }
+    int images_count = load_thumbnail_list();
+    int current_image = 0;
+
+    jpeg_buffer = heap_caps_malloc(MAX_JPEG_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!jpeg_buffer) jpeg_buffer = malloc(MAX_JPEG_SIZE); // Fallback to internal RAM
+
+    if (!out_buf) {
+        // Already logged above
+    } else {
+        lcd_show_status_screen((uint16_t *)out_buf, "Ready", "Starting slideshow", 0x0000, 0xFFFF);
+    }
+
     // --- Loop ---
     TickType_t last_press_tick_trigger = 0;
     TickType_t last_press_tick_menu = 0;
     bool menu_visible = false;
     int menu_selected = 0;
-    int images_count = 0;
-    if (out_buf) {
-        images_count = load_thumbnail_list();
-    } else {
-        ESP_LOGE(TAG, "No decode buffer available; cannot download thumbnails");
-    }
-    int current_image = 0;
     TickType_t last_switch_tick = xTaskGetTickCount();
     if (images_count > 0 && s_images[0].valid && out_buf) {
         fetch_and_draw_image(&s_images[0], out_buf, out_buf_size);
@@ -900,7 +1052,7 @@ void app_main(void)
                     ESP_LOGI(TAG, "Button 0 Pressed! Sending Trigger...");
 
                     esp_http_client_config_t config_post = {
-                        .url = "https://coordination-zope-counter-newspapers.trycloudflare.com/recorder/trigger",
+                        .url = "https://camera.boxhoster.com/recorder/trigger",
                         .method = HTTP_METHOD_POST,
                         .timeout_ms = 10000,
                         .cert_pem = CLOUDFLARE_CA_PEM,
@@ -920,7 +1072,7 @@ void app_main(void)
         }
 
         if (!menu_visible && images_count > 0) {
-            if ((now_tick - last_switch_tick) >= pdMS_TO_TICKS(5000)) {
+            if ((now_tick - last_switch_tick) >= pdMS_TO_TICKS(IMAGE_ROTATION_INTERVAL_MS)) {
                 last_switch_tick = now_tick;
                 image_slot_t *img = &s_images[current_image];
                 if (img->valid && out_buf) {
