@@ -1046,26 +1046,47 @@ void app_main(void)
             } else if (evt.id == BTN_ID_TRIGGER) {
                 if (menu_visible) {
                     if (menu_selected == MENU_ITEM_POWER) {
+                        if (out_buf) {
+                            lcd_show_status_screen((uint16_t *)out_buf, "Powering off", "Entering deep sleep", 0x0000, 0xFFFF);
+                        }
                         enter_deep_sleep();
                     }
                 } else {
                     ESP_LOGI(TAG, "Button 0 Pressed! Sending Trigger...");
-
-                    esp_http_client_config_t config_post = {
-                        .url = "https://camera.boxhoster.com/recorder/trigger",
-                        .method = HTTP_METHOD_POST,
-                        .timeout_ms = 10000,
-                        .cert_pem = CLOUDFLARE_CA_PEM,
-                        .cert_len = sizeof(CLOUDFLARE_CA_PEM),
-                    };
-                    esp_http_client_handle_t client_post = esp_http_client_init(&config_post);
-                    esp_err_t post_err = esp_http_client_perform(client_post);
-                    esp_http_client_cleanup(client_post);
-
-                    if (post_err == ESP_OK) {
-                        ESP_LOGI(TAG, "Trigger Sent.");
+                    if (!s_wifi_connected) {
+                        ESP_LOGW(TAG, "Trigger skipped: Wi-Fi not connected");
+                        if (out_buf) {
+                            lcd_show_status_screen((uint16_t *)out_buf, "Trigger skipped", "No Wi-Fi connection", 0x0000, 0xF800);
+                            last_switch_tick = now_tick;
+                        }
                     } else {
-                        ESP_LOGE(TAG, "Trigger Failed: %s", esp_err_to_name(post_err));
+                        if (out_buf) {
+                            lcd_show_status_screen((uint16_t *)out_buf, "Trigger", "Sending...", 0x0000, 0xFFFF);
+                        }
+                        esp_http_client_config_t config_post = {
+                            .url = "https://camera.boxhoster.com/recorder/trigger",
+                            .method = HTTP_METHOD_POST,
+                            .timeout_ms = 10000,
+                            .cert_pem = CLOUDFLARE_CA_PEM,
+                            .cert_len = sizeof(CLOUDFLARE_CA_PEM),
+                        };
+                        esp_http_client_handle_t client_post = esp_http_client_init(&config_post);
+                        esp_err_t post_err = esp_http_client_perform(client_post);
+                        esp_http_client_cleanup(client_post);
+
+                        if (post_err == ESP_OK) {
+                            ESP_LOGI(TAG, "Trigger Sent.");
+                            if (out_buf) {
+                                lcd_show_status_screen((uint16_t *)out_buf, "Trigger sent", "Success", 0x0000, 0x07E0);
+                                last_switch_tick = now_tick;
+                            }
+                        } else {
+                            ESP_LOGE(TAG, "Trigger Failed: %s", esp_err_to_name(post_err));
+                            if (out_buf) {
+                                lcd_show_status_screen((uint16_t *)out_buf, "Trigger failed", esp_err_to_name(post_err), 0x0000, 0xF800);
+                                last_switch_tick = now_tick;
+                            }
+                        }
                     }
                 }
             }
