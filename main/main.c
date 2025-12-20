@@ -14,6 +14,7 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_http_client.h"
+#include "esp_websocket_client.h"
 #include "esp_sntp.h"
 #include "driver/gpio.h"
 #include "esp_crt_bundle.h"
@@ -36,6 +37,17 @@
 #define WIFI_SSID      "AndroidAP4484"
 #define WIFI_PASS      "dflg7101"
 #define API_URL        "https://camera.boxhoster.com/"
+#define WS_URL         "wss://camera.boxhoster.com/cable"
+// ActionCable typically advertises both protocol names; send both to satisfy strict servers.
+#define WS_SUBPROTO    "actioncable-v1-json,actioncable-unsupported"
+#define WS_IDENTIFIER_RAW "{\"channel\":\"RecordingChannel\"}"
+// This needs to be JSON-escaped inside the subscribe frame.
+#define WS_IDENTIFIER_ESCAPED "{\\\"channel\\\":\\\"RecordingChannel\\\"}"
+#define WS_SUBSCRIBE_MSG "{\"command\":\"subscribe\",\"identifier\":\"" WS_IDENTIFIER_ESCAPED "\"}"
+#define WS_RETRY_INTERVAL_MS 5000
+#define WS_BUFFER_SIZE 2048
+#define WS_MESSAGE_BUF_SIZE 4096
+#define WS_ORIGIN      "https://camera.boxhoster.com"
 
 static const char CLOUDFLARE_CA_PEM[] =
 "-----BEGIN CERTIFICATE-----\n"
@@ -244,6 +256,12 @@ static image_slot_t s_images[MAX_IMAGES];
 static esp_lcd_panel_handle_t panel_handle = NULL;
 // Two chunk buffers for ping-pong, so we never overwrite a buffer while a DMA transfer is still in flight.
 static DMA_ATTR uint16_t s_chunk_buf[2][LCD_DMA_CHUNK_BYTES / sizeof(uint16_t)] __attribute__((aligned(LCD_DMA_ALIGN)));
+static esp_websocket_client_handle_t s_ws_client = NULL;
+static volatile bool s_feed_reload_requested = false;
+static TickType_t s_last_ws_start_attempt = 0;
+static char s_ws_msg_buf[WS_MESSAGE_BUF_SIZE];
+static size_t s_ws_msg_len = 0;
+static size_t s_ws_msg_expected = 0;
 
 // Forward declarations for helpers used before definition
 static void lcd_fill_color(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, uint16_t color);
@@ -321,6 +339,15 @@ static void free_json_buffer(void) {
     }
 }
 
+static void clear_image_cache(void) {
+    for (int i = 0; i < MAX_IMAGES; i++) {
+        if (s_images[i].jpeg) {
+            free(s_images[i].jpeg);
+        }
+        memset(&s_images[i], 0, sizeof(image_slot_t));
+    }
+}
+
 static esp_err_t http_collect_event_handler(esp_http_client_event_t *evt) {
     http_buffer_ctx_t *ctx = (http_buffer_ctx_t *)evt->user_data;
     if (!ctx || !ctx->buf || !ctx->out_len) return ESP_OK;
@@ -372,7 +399,7 @@ static bool fetch_json_feed(void) {
     return json_len > 0;
 }
 
-static bool parse_thumbnail_urls(const char *json, int *out_count) {
+static bool parse_thumbnail_urls(const char *json, image_slot_t *slots, int *out_count) {
     if (!json || !out_count) return false;
     *out_count = 0;
 
@@ -398,13 +425,13 @@ static bool parse_thumbnail_urls(const char *json, int *out_count) {
             continue;
         }
         size_t len = strnlen(url->valuestring, MAX_URL_LEN - 1);
-        memset(&s_images[idx], 0, sizeof(image_slot_t));
-        memcpy(s_images[idx].url, url->valuestring, len);
-        s_images[idx].url[len] = '\0';
-        s_images[idx].valid = true;
-        s_images[idx].jpeg = NULL;
-        s_images[idx].jpeg_len = 0;
-        s_images[idx].loaded = false;
+        memset(&slots[idx], 0, sizeof(image_slot_t));
+        memcpy(slots[idx].url, url->valuestring, len);
+        slots[idx].url[len] = '\0';
+        slots[idx].valid = true;
+        slots[idx].jpeg = NULL;
+        slots[idx].jpeg_len = 0;
+        slots[idx].loaded = false;
         idx++;
     }
 
@@ -507,18 +534,162 @@ static int load_thumbnail_list(void) {
         ESP_LOGW(TAG, "Skipping downloads; Wi-Fi not connected");
         return 0;
     }
+    image_slot_t new_slots[MAX_IMAGES];
+    memset(new_slots, 0, sizeof(new_slots));
     if (!fetch_json_feed()) {
         free_json_buffer();
         return 0;
     }
     int found = 0;
-    if (!parse_thumbnail_urls(json_buffer, &found)) {
+    if (!parse_thumbnail_urls(json_buffer, new_slots, &found)) {
         free_json_buffer();
         return 0;
     }
     free_json_buffer(); // release heap before allocating large decode buffers
+    clear_image_cache();
+    memcpy(s_images, new_slots, sizeof(new_slots));
     ESP_LOGI(TAG, "Cached %d thumbnail URLs", found);
     return found;
+}
+
+static void handle_actioncable_message(const char *payload, size_t len) {
+    if (!payload || len == 0) {
+        return;
+    }
+    // Inspect messages even if parsing later fails to confirm traffic on the wire.
+    int preview_len = len > 256 ? 256 : (int)len;
+    ESP_LOGI(TAG, "WS payload (%u bytes)%s: %.*s",
+             (unsigned)len,
+             len > 256 ? " [truncated]" : "",
+             preview_len,
+             payload);
+    char *buf = malloc(len + 1);
+    if (!buf) {
+        ESP_LOGE(TAG, "No heap for websocket message (%u bytes)", (unsigned)len);
+        return;
+    }
+    memcpy(buf, payload, len);
+    buf[len] = '\0';
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) {
+        ESP_LOGW(TAG, "WS JSON parse failed");
+        return;
+    }
+
+    cJSON *type = cJSON_GetObjectItem(root, "type");
+    if (cJSON_IsString(type)) {
+        if (strcmp(type->valuestring, "welcome") == 0 || strcmp(type->valuestring, "ping") == 0) {
+            cJSON_Delete(root);
+            return;
+        }
+        if (strcmp(type->valuestring, "confirm_subscription") == 0) {
+            ESP_LOGI(TAG, "Subscribed to RecordingChannel (confirm_subscription)");
+            cJSON_Delete(root);
+            return;
+        }
+    }
+
+    cJSON *message = cJSON_GetObjectItem(root, "message");
+    if (cJSON_IsObject(message)) {
+        cJSON *action = cJSON_GetObjectItem(message, "action");
+        if (cJSON_IsString(action)) {
+            ESP_LOGI(TAG, "WS message action: %s", action->valuestring);
+        } else {
+            ESP_LOGW(TAG, "WS message missing action field");
+        }
+        if (cJSON_IsString(action) && strcmp(action->valuestring, "upload_success") == 0) {
+            ESP_LOGI(TAG, "Upload success notification received; scheduling feed reload");
+            s_feed_reload_requested = true;
+        }
+    }
+    cJSON_Delete(root);
+}
+
+static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+    esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
+    switch (event_id) {
+        case WEBSOCKET_EVENT_CONNECTED: {
+            ESP_LOGI(TAG, "WebSocket connected");
+            const char *subscribe_msg = WS_SUBSCRIBE_MSG;
+            ESP_LOGI(TAG, "Sending subscribe: %s", subscribe_msg);
+            esp_websocket_client_send_text(data->client, subscribe_msg, strlen(subscribe_msg), pdMS_TO_TICKS(1000));
+            break;
+        }
+        case WEBSOCKET_EVENT_DISCONNECTED:
+            ESP_LOGW(TAG, "WebSocket disconnected");
+            break;
+        case WEBSOCKET_EVENT_DATA:
+            if (data->op_code == WS_TRANSPORT_OPCODES_TEXT && data->data_len > 0) {
+                bool is_first = data->payload_offset == 0;
+                bool is_last = (data->payload_offset + data->data_len) >= data->payload_len;
+                if (is_first) {
+                    s_ws_msg_len = 0;
+                    s_ws_msg_expected = data->payload_len;
+                }
+                ESP_LOGI(TAG, "WS data chunk len=%d total=%d offset=%d first=%d last=%d",
+                         data->data_len, data->payload_len, data->payload_offset, is_first, is_last);
+                int log_len = data->data_len > 256 ? 256 : data->data_len;
+                ESP_LOGI(TAG, "WS chunk preview: %.*s%s",
+                         log_len, (const char *)data->data_ptr,
+                         data->data_len > log_len ? " ..." : "");
+
+                size_t remaining = WS_MESSAGE_BUF_SIZE - 1 - s_ws_msg_len;
+                if ((size_t)data->data_len > remaining) {
+                    ESP_LOGE(TAG, "WS message buffer overflow (need %u, have %u); dropping message",
+                             (unsigned)data->data_len, (unsigned)remaining);
+                    s_ws_msg_len = 0;
+                    s_ws_msg_expected = 0;
+                    break;
+                }
+
+                memcpy(s_ws_msg_buf + s_ws_msg_len, data->data_ptr, data->data_len);
+                s_ws_msg_len += data->data_len;
+
+                if (is_last || data->payload_len == 0) {
+                    s_ws_msg_buf[s_ws_msg_len] = '\0';
+                    ESP_LOGI(TAG, "WS assembled message len=%u expected=%u", (unsigned)s_ws_msg_len, (unsigned)s_ws_msg_expected);
+                    handle_actioncable_message(s_ws_msg_buf, s_ws_msg_len);
+                    s_ws_msg_len = 0;
+                    s_ws_msg_expected = 0;
+                }
+            }
+            break;
+        case WEBSOCKET_EVENT_ERROR:
+            ESP_LOGW(TAG, "WebSocket error encountered");
+            break;
+        default:
+            break;
+    }
+}
+
+static void start_recording_websocket(void) {
+    if (s_ws_client) {
+        return;
+    }
+    esp_websocket_client_config_t ws_cfg = {
+        .uri = WS_URL,
+        .cert_pem = CLOUDFLARE_CA_PEM,
+        .cert_len = sizeof(CLOUDFLARE_CA_PEM),
+        .subprotocol = WS_SUBPROTO,
+        .headers = "Origin: " WS_ORIGIN "\r\n",
+        .buffer_size = WS_BUFFER_SIZE, // Allow larger handshake headers (e.g., via Cloudflare)
+        .reconnect_timeout_ms = 5000,
+        .network_timeout_ms = 10000,
+    };
+    s_ws_client = esp_websocket_client_init(&ws_cfg);
+    if (!s_ws_client) {
+        ESP_LOGE(TAG, "Failed to init WebSocket client");
+        return;
+    }
+    esp_websocket_register_events(s_ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL);
+    ESP_LOGI(TAG, "Connecting to WebSocket: %s", WS_URL);
+    esp_err_t err = esp_websocket_client_start(s_ws_client);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "WebSocket start failed: %s", esp_err_to_name(err));
+        esp_websocket_client_destroy(s_ws_client);
+        s_ws_client = NULL;
+    }
 }
 
 // --- Display ---
@@ -1017,6 +1188,35 @@ void app_main(void)
     }
     while (1) {
         TickType_t now_tick = xTaskGetTickCount();
+        if (!s_ws_client && s_wifi_connected &&
+            (s_last_ws_start_attempt == 0 || (now_tick - s_last_ws_start_attempt) >= pdMS_TO_TICKS(WS_RETRY_INTERVAL_MS))) {
+            s_last_ws_start_attempt = now_tick;
+            start_recording_websocket();
+        }
+
+        if (s_feed_reload_requested) {
+            s_feed_reload_requested = false;
+            ESP_LOGI(TAG, "Reloading feed after upload_success notification");
+            if (out_buf) {
+                lcd_show_status_screen((uint16_t *)out_buf, "Updating", "Loading latest photos", 0x0000, 0xFFFF);
+            }
+            int new_count = load_thumbnail_list();
+            if (new_count > 0) {
+                images_count = new_count;
+                current_image = 0;
+                if (!menu_visible && out_buf && s_images[0].valid) {
+                    if (!fetch_and_draw_image(&s_images[0], out_buf, out_buf_size)) {
+                        ESP_LOGE(TAG, "Failed to display refreshed image 0");
+                    } else {
+                        last_switch_tick = xTaskGetTickCount();
+                        current_image = (images_count > 1) ? 1 : 0;
+                    }
+                }
+            } else {
+                ESP_LOGW(TAG, "Feed reload returned no images; keeping existing list");
+            }
+        }
+
         button_event_t evt;
         while (xQueueReceive(s_button_queue, &evt, 0) == pdTRUE) {
             TickType_t *last_tick = (evt.id == BTN_ID_MENU) ? &last_press_tick_menu : &last_press_tick_trigger;
