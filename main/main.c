@@ -1356,6 +1356,8 @@ void app_main(void)
                             .cert_len = sizeof(CLOUDFLARE_CA_PEM),
                         };
                         esp_http_client_handle_t client_post = esp_http_client_init(&config_post);
+                        // Request JSON so the server responds with 200 JSON instead of HTML redirect.
+                        esp_http_client_set_header(client_post, "Accept", "application/json");
                         esp_err_t post_err = esp_http_client_perform(client_post);
                         esp_http_client_cleanup(client_post);
 
