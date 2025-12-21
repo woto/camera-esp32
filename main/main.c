@@ -692,6 +692,15 @@ static void start_recording_websocket(void) {
     }
 }
 
+static void stop_recording_websocket(void) {
+    if (!s_ws_client) {
+        return;
+    }
+    esp_websocket_client_stop(s_ws_client);
+    esp_websocket_client_destroy(s_ws_client);
+    s_ws_client = NULL;
+}
+
 // --- Display ---
 void draw_rgb565(uint16_t *pixels, int w, int h) {
     if (w > LCD_H_RES) w = LCD_H_RES; // Crop if necessary
@@ -843,8 +852,10 @@ static void lcd_show_status_screen(uint16_t *frame_buf, const char *line1, const
     }
 }
 
-#define MENU_ITEMS 4
-#define MENU_ITEM_POWER 3
+#define MENU_ITEMS 3
+#define MENU_ITEM_BATTERY 0
+#define MENU_ITEM_FAST_SLEEP 1
+#define MENU_ITEM_DEEP_SLEEP 2
 
 static void lcd_fill_rect(uint16_t *frame_buf, int x, int y, int w, int h, uint16_t color) {
     if (!frame_buf) return;
@@ -884,9 +895,8 @@ static void lcd_render_menu(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, i
     }
     const char *labels[MENU_ITEMS] = {
         voltage_label,
-        "EMPTY",
-        "EMPTY",
-        "POWER OFF",
+        "FAST SLEEP",
+        "DEEP SLEEP",
     };
     for (int i = 0; i < MENU_ITEMS; i++) {
         int y = start_y + i * (box_h + gap);
@@ -934,6 +944,71 @@ static void enter_deep_sleep(void) {
         gpio_set_level((gpio_num_t)PIN_NUM_PWR, 0);
     }
     esp_deep_sleep_start();
+}
+
+static void enter_fast_sleep(void) {
+    uint64_t mask = 0;
+    if (esp_sleep_is_valid_wakeup_gpio(BUTTON_GPIO)) {
+        rtc_gpio_init(BUTTON_GPIO);
+        rtc_gpio_set_direction(BUTTON_GPIO, RTC_GPIO_MODE_INPUT_ONLY);
+        rtc_gpio_pullup_en(BUTTON_GPIO);
+        rtc_gpio_pulldown_dis(BUTTON_GPIO);
+        mask |= (1ULL << BUTTON_GPIO);
+    }
+    if (esp_sleep_is_valid_wakeup_gpio(BUTTON_GPIO_2)) {
+        rtc_gpio_init(BUTTON_GPIO_2);
+        rtc_gpio_set_direction(BUTTON_GPIO_2, RTC_GPIO_MODE_INPUT_ONLY);
+        rtc_gpio_pullup_en(BUTTON_GPIO_2);
+        rtc_gpio_pulldown_dis(BUTTON_GPIO_2);
+        mask |= (1ULL << BUTTON_GPIO_2);
+    }
+    if (mask == 0) {
+        ESP_LOGE(TAG, "No valid wakeup GPIOs configured, aborting fast sleep");
+        return;
+    }
+    while (gpio_get_level(BUTTON_GPIO) == 0 || gpio_get_level(BUTTON_GPIO_2) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    stop_recording_websocket();
+    s_wifi_connected = false;
+    esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+    esp_err_t wifi_err = esp_wifi_stop();
+    if (wifi_err != ESP_OK && wifi_err != ESP_ERR_WIFI_NOT_INIT && wifi_err != ESP_ERR_WIFI_STOP_STATE) {
+        ESP_LOGW(TAG, "Wi-Fi stop failed: %s", esp_err_to_name(wifi_err));
+    }
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW));
+    if (PIN_NUM_BL >= 0) {
+        gpio_set_level((gpio_num_t)PIN_NUM_BL, 0);
+    }
+    if (PIN_NUM_PWR >= 0) {
+        gpio_set_level((gpio_num_t)PIN_NUM_PWR, 0);
+    }
+    esp_light_sleep_start();
+    if (PIN_NUM_PWR >= 0) {
+        gpio_set_level((gpio_num_t)PIN_NUM_PWR, 1);
+    }
+    // Panel lost power; re-init to restore display output
+    if (panel_handle) {
+        ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
+        ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, LCD_X_OFFSET, LCD_Y_OFFSET));
+        ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
+        ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+    } else {
+        ESP_LOGW(TAG, "No panel handle to re-init after fast sleep");
+    }
+    esp_err_t wifi_start_err = esp_wifi_start();
+    if (wifi_start_err != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi start after fast sleep failed: %s", esp_err_to_name(wifi_start_err));
+    } else {
+        esp_wifi_set_ps(WIFI_PS_NONE);
+    }
+    if (PIN_NUM_BL >= 0) {
+        gpio_set_level((gpio_num_t)PIN_NUM_BL, 1);
+    }
+    s_last_ws_start_attempt = 0;
+    xQueueReset(s_button_queue);
 }
 
 static void init_battery_adc(void) {
@@ -1245,7 +1320,17 @@ void app_main(void)
                 }
             } else if (evt.id == BTN_ID_TRIGGER) {
                 if (menu_visible) {
-                    if (menu_selected == MENU_ITEM_POWER) {
+                    if (menu_selected == MENU_ITEM_FAST_SLEEP) {
+                        if (out_buf) {
+                            lcd_show_status_screen((uint16_t *)out_buf, "Fast sleep", "Press button to wake", 0x0000, 0xFFFF);
+                        }
+                        enter_fast_sleep();
+                        menu_visible = false;
+                        if (out_buf) {
+                            lcd_show_status_screen((uint16_t *)out_buf, "Waking", "Restoring...", 0x0000, 0xFFFF);
+                        }
+                        last_switch_tick = xTaskGetTickCount();
+                    } else if (menu_selected == MENU_ITEM_DEEP_SLEEP) {
                         if (out_buf) {
                             lcd_show_status_screen((uint16_t *)out_buf, "Powering off", "Entering deep sleep", 0x0000, 0xFFFF);
                         }
