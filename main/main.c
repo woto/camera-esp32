@@ -45,7 +45,7 @@
 // --- CONFIG ---
 #define WIFI_SSID      "AndroidAP4484"
 #define WIFI_PASS      "dflg7101"
-#define API_URL        "https://camera.boxhoster.com/"
+#define API_URL        "https://volleycam.com/"
 
 // --- Lilygo T-Display S3 (1.9" ST7789, 8-bit I80) Pinout ---
 #define PIN_NUM_D0   39

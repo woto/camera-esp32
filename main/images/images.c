@@ -15,7 +15,7 @@
 #include "util/room_id.h"
 
 static const char *TAG = "IMAGES";
-static const char *API_URL = "https://camera.boxhoster.com/";
+static const char *API_URL = "https://volleycam.com/";
 
 #define JSON_BUFFER_SIZE 65536
 #define MAX_JPEG_SIZE (32 * 1024)

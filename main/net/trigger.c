@@ -23,7 +23,7 @@ esp_err_t trigger_send(void) {
     }
 
     esp_http_client_config_t config_post = {
-        .url = "https://camera.boxhoster.com/recorder/trigger",
+        .url = "https://volleycam.com/recorder/trigger",
         .method = HTTP_METHOD_POST,
         .timeout_ms = 10000,
         .cert_pem = CLOUDFLARE_CA_PEM,

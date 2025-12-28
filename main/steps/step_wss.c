@@ -8,13 +8,13 @@
 #include "net/ws_handler.h"
 #include "util/room_id.h"
 
-#define WS_URL         "wss://camera.boxhoster.com/cable"
+#define WS_URL         "wss://volleycam.com/cable"
 #define WS_SUBPROTO    "actioncable-v1-json,actioncable-unsupported"
 #define WS_IDENTIFIER_ESCAPED "{\\\"channel\\\":\\\"RecordingChannel\\\"}"
 #define WS_SUBSCRIBE_MSG "{\"command\":\"subscribe\",\"identifier\":\"" WS_IDENTIFIER_ESCAPED "\"}"
 #define WS_BUFFER_SIZE 2048
 #define WS_MESSAGE_BUF_SIZE 4096
-#define WS_ORIGIN      "https://camera.boxhoster.com"
+#define WS_ORIGIN      "https://volleycam.com"
 
 static const char *TAG = "STEP-WSS";
 static esp_websocket_client_handle_t s_ws_client = NULL;
