@@ -22,7 +22,6 @@ bool images_fetch_and_show(image_slot_t *slot,
                            uint16_t *decode_buf,
                            size_t decode_buf_size,
                            esp_lcd_panel_handle_t panel,
-                           bool wifi_connected,
-                           bool ws_connected);
+                           bool wifi_connected);
 int images_get_count(void);
 image_slot_t *images_slots(void);

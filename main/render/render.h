@@ -11,4 +11,4 @@ void render_framebuf_fill_color(uint16_t *frame_buf, uint16_t color);
 void render_fill_rect(uint16_t *frame_buf, int x, int y, int w, int h, uint16_t color);
 void render_draw_rect_outline(uint16_t *frame_buf, int x, int y, int w, int h, uint16_t color);
 void render_draw_text(uint16_t *frame_buf, int x, int y, const char *text, uint16_t color);
-void render_status_screen(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, const char *line1, const char *line2, uint16_t bg_color, uint16_t fg_color, bool wifi_connected, bool ws_connected);
+void render_status_screen(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, const char *line1, const char *line2, uint16_t bg_color, uint16_t fg_color, bool wifi_connected);

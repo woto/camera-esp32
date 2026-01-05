@@ -280,8 +280,7 @@ bool images_fetch_and_show(image_slot_t *slot,
                            uint16_t *decode_buf,
                            size_t decode_buf_size,
                            esp_lcd_panel_handle_t panel,
-                           bool wifi_connected,
-                           bool ws_connected) {
+                           bool wifi_connected) {
     if (!slot || !decode_buf) return false;
     if (!slot->loaded) {
         if (!wifi_connected) {
@@ -324,7 +323,7 @@ bool images_fetch_and_show(image_slot_t *slot,
         return false;
     }
 
-    icons_draw_status_badges((uint16_t *)decode_buf, wifi_connected, ws_connected);
+    icons_draw_status_badges((uint16_t *)decode_buf, wifi_connected);
     bool ok = render_panel_draw_bitmap_chunked(panel, (uint16_t *)decode_buf, outimg.width, outimg.height);
     if (ok) {
         ESP_LOGI(TAG, "Thumbnail shown: %dx%d", outimg.width, outimg.height);

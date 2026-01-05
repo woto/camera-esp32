@@ -15,7 +15,6 @@ typedef struct {
     int lcd_y_offset;
     esp_lcd_panel_handle_t panel;
     QueueHandle_t button_queue;
-    TickType_t *last_ws_start_attempt;
     volatile bool *wifi_connected;
 } sleep_ctx_t;
 

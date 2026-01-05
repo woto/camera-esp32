@@ -6,9 +6,9 @@
 
 static const char *TAG = "STARTUP";
 
-static void show_digest_error(uint16_t *out_buf, esp_lcd_panel_handle_t panel_handle, bool wifi_connected, bool ws_connected, int error_pause_ms) {
+static void show_digest_error(uint16_t *out_buf, esp_lcd_panel_handle_t panel_handle, bool wifi_connected, int error_pause_ms) {
     if (out_buf) {
-        render_status_screen(panel_handle, out_buf, "Digest error", "No data", 0x0000, 0xF800, wifi_connected, ws_connected);
+        render_status_screen(panel_handle, out_buf, "Digest error", "No data", 0x0000, 0xF800, wifi_connected);
         vTaskDelay(pdMS_TO_TICKS(error_pause_ms));
     }
 }
@@ -31,7 +31,7 @@ void startup_init(startup_ctx_t *ctx,
     // Wi-Fi
     ESP_LOGI(TAG, "Connecting to Wi-Fi...");
     if (out_buf) {
-        render_status_screen(panel_handle, out_buf, "Wi-Fi", NULL, 0x0000, 0xFFFF, wifi_ctrl_is_connected(), step_wss_is_connected());
+        render_status_screen(panel_handle, out_buf, "Wi-Fi", NULL, 0x0000, 0xFFFF, wifi_ctrl_is_connected());
     }
     vTaskDelay(pdMS_TO_TICKS(debug_delay_ms));
     wifi_ctrl_init(wifi_ssid, wifi_pass);
@@ -51,7 +51,7 @@ void startup_init(startup_ctx_t *ctx,
     } else {
         ESP_LOGW(TAG, "Wi-Fi connect timeout; waiting for Wi-Fi");
         if (out_buf) {
-            render_status_screen(panel_handle, out_buf, "Wi-Fi error", "No link", 0x0000, 0xF800, wifi_ctrl_is_connected(), step_wss_is_connected());
+            render_status_screen(panel_handle, out_buf, "Wi-Fi error", "No link", 0x0000, 0xF800, wifi_ctrl_is_connected());
             vTaskDelay(pdMS_TO_TICKS(error_pause_ms));
         }
         ctx->step = START_STEP_WIFI;
@@ -62,9 +62,9 @@ void startup_init(startup_ctx_t *ctx,
     if (ctx->step == START_STEP_SNTP) {
         if (wifi_connected && step_sntp_run(out_buf, wifi_connected, debug_delay_ms, error_pause_ms)) {
             vTaskDelay(pdMS_TO_TICKS(debug_delay_ms));
-            ctx->step = START_STEP_WSS;
+            ctx->step = START_STEP_DIGEST;
             ctx->steps_state.time_synced = true;
-            ctx->steps_state.step = START_STEP_WSS;
+            ctx->steps_state.step = START_STEP_DIGEST;
         } else {
             ctx->time_sync_pending = true;
         }
@@ -89,7 +89,7 @@ void startup_init(startup_ctx_t *ctx,
             } else {
                 ctx->digest_wait_wifi = true;
                 ctx->digest_pending = true;
-                show_digest_error(out_buf, panel_handle, wifi_connected, step_wss_is_connected(), error_pause_ms);
+                show_digest_error(out_buf, panel_handle, wifi_connected, error_pause_ms);
             }
         }
     } else if (ctx->step != START_STEP_READY) {
@@ -116,7 +116,7 @@ static void handle_digest_attempt(startup_ctx_t *ctx,
     }
 
     if (out_buf) {
-        render_status_screen(panel_handle, out_buf, "Digest", NULL, 0x0000, 0xFFFF, wifi_connected, step_wss_is_connected());
+        render_status_screen(panel_handle, out_buf, "Digest", NULL, 0x0000, 0xFFFF, wifi_connected);
     }
     vTaskDelay(pdMS_TO_TICKS(debug_delay_ms));
 
@@ -129,7 +129,7 @@ static void handle_digest_attempt(startup_ctx_t *ctx,
         ctx->current_image = 0;
         ctx->step = ctx->steps_state.step;
         if (!menu_visible && out_buf && images[0].valid) {
-            if (images_fetch_and_show(&images[0], out_buf, out_buf_size, panel_handle, wifi_connected, step_wss_is_connected())) {
+            if (images_fetch_and_show(&images[0], out_buf, out_buf_size, panel_handle, wifi_connected)) {
                 *last_switch_tick = xTaskGetTickCount();
                 *current_image = (new_count > 1) ? 1 : 0;
             } else {
@@ -138,7 +138,7 @@ static void handle_digest_attempt(startup_ctx_t *ctx,
             }
         }
     } else {
-        show_digest_error(out_buf, panel_handle, wifi_connected, step_wss_is_connected(), error_pause_ms);
+        show_digest_error(out_buf, panel_handle, wifi_connected, error_pause_ms);
         ctx->digest_pending = true;
         ctx->digest_wait_wifi = true;
     }
@@ -148,7 +148,6 @@ void startup_handle_loop(startup_ctx_t *ctx,
                          bool wifi_connected,
                          bool wifi_state_changed,
                          bool wifi_just_connected,
-                         bool ws_state_changed,
                          bool menu_visible,
                          image_slot_t *images,
                          uint16_t *out_buf,
@@ -162,12 +161,6 @@ void startup_handle_loop(startup_ctx_t *ctx,
 
     ctx->steps_state.wifi_connected = wifi_connected;
 
-    if (ctx->step == START_STEP_WSS && step_wss_is_connected()) {
-        ctx->step = START_STEP_DIGEST;
-        ctx->digest_pending = true;
-        ctx->digest_wait_wifi = false;
-    }
-
     if (wifi_state_changed && !wifi_connected) {
         ctx->digest_wait_wifi = true;
     }
@@ -180,13 +173,13 @@ void startup_handle_loop(startup_ctx_t *ctx,
         }
         if (ctx->time_sync_pending && !step_sntp_is_synced() && wifi_connected) {
             if (out_buf) {
-                render_status_screen(panel_handle, out_buf, "Time", NULL, 0x0000, 0xFFFF, wifi_connected, step_wss_is_connected());
+                render_status_screen(panel_handle, out_buf, "Time", NULL, 0x0000, 0xFFFF, wifi_connected);
             }
             vTaskDelay(pdMS_TO_TICKS(debug_delay_ms));
             if (step_sntp_run(out_buf, wifi_connected, debug_delay_ms, error_pause_ms)) {
                 vTaskDelay(pdMS_TO_TICKS(debug_delay_ms));
                 ctx->time_sync_pending = false;
-                ctx->step = START_STEP_WSS;
+                ctx->step = START_STEP_DIGEST;
             } else {
                 ctx->time_sync_pending = true;
                 ctx->step = START_STEP_SNTP;
@@ -199,38 +192,4 @@ void startup_handle_loop(startup_ctx_t *ctx,
         }
     }
 
-    if (step_wss_take_feed_reload()) {
-        ESP_LOGI(TAG, "Reloading feed after upload_success notification");
-        if (out_buf) {
-            render_status_screen(panel_handle, out_buf, "Digest", NULL, 0x0000, 0xFFFF, wifi_connected, step_wss_is_connected());
-        }
-        if (!wifi_connected) {
-            ctx->digest_pending = true;
-            ctx->step = START_STEP_DIGEST;
-            step_digest_begin(&ctx->steps_state, out_buf);
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(debug_delay_ms));
-            ctx->steps_state.wifi_connected = wifi_connected;
-            int new_count = ctx->images_count;
-            bool ok = step_digest_attempt(&ctx->steps_state, out_buf, &new_count);
-            ctx->digest_pending = ctx->steps_state.digest_pending;
-            if (ok && new_count > 0) {
-                ctx->images_count = new_count;
-                ctx->current_image = 0;
-                ctx->step = ctx->steps_state.step;
-                if (!menu_visible && out_buf && images[0].valid) {
-                    if (images_fetch_and_show(&images[0], out_buf, out_buf_size, panel_handle, wifi_connected, step_wss_is_connected())) {
-                        *last_switch_tick = xTaskGetTickCount();
-                        *current_image = (new_count > 1) ? 1 : 0;
-                    } else {
-                        ESP_LOGE(TAG, "Failed to display refreshed image 0");
-                        ctx->step = START_STEP_DIGEST;
-                    }
-                }
-            } else {
-                ESP_LOGW(TAG, "Feed reload returned no images; keeping existing list");
-                show_digest_error(out_buf, panel_handle, wifi_connected, step_wss_is_connected(), error_pause_ms);
-            }
-        }
-    }
 }

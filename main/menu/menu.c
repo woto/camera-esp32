@@ -5,7 +5,7 @@
 #include "esp_log.h"
 #include "util/room_id.h"
 
-void menu_render(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, int selected, int bat_mv, bool wifi_connected, bool ws_connected) {
+void menu_render(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, int selected, int bat_mv, bool wifi_connected) {
     (void)panel;
     if (!frame_buf) return;
     render_framebuf_fill_color(frame_buf, 0x0000);
@@ -47,6 +47,6 @@ void menu_render(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, int selected
             render_draw_text(frame_buf, start_x + 10, y + 12, labels[i], 0xFFFF);
         }
     }
-    icons_draw_status_badges(frame_buf, wifi_connected, ws_connected);
+    icons_draw_status_badges(frame_buf, wifi_connected);
     render_panel_draw_bitmap_chunked(panel, frame_buf, LCD_H_RES, LCD_V_RES);
 }

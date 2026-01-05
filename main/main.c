@@ -35,7 +35,6 @@
 #include "startup/startup.h"
 #include "net/wifi_ctrl.h"
 #include "net/trigger.h"
-#include "net/ws_handler.h"
 #include "images/images.h"
 #include "power/battery.h"
 
@@ -74,7 +73,7 @@
 #define STATUS_ERROR_PAUSE_MS 1200
 #define WIFI_RECONNECT_INTERVAL_MS 1000
 #define STEP_DEBUG_PAUSE_MS 1000
-#define WS_RETRY_INTERVAL_MS 5000
+#define MENU_WAKE_GUARD_MS 400
 
 #define BAT_ADC_UNIT ADC_UNIT_1
 #define BAT_ADC_CHANNEL ADC_CHANNEL_3
@@ -102,6 +101,31 @@ typedef struct {
     TickType_t tick;
 } button_event_t;
 
+typedef enum {
+    WAKE_ACTION_NONE = 0,
+    WAKE_ACTION_TRIGGER,
+    WAKE_ACTION_DIGEST,
+} wake_action_t;
+
+static wake_action_t wake_action_from_mask(uint64_t mask) {
+    if (mask & (1ULL << BUTTON_GPIO)) {
+        return WAKE_ACTION_TRIGGER;
+    }
+    if (mask & (1ULL << BUTTON_GPIO_2)) {
+        return WAKE_ACTION_DIGEST;
+    }
+    return WAKE_ACTION_NONE;
+}
+
+static wake_action_t detect_wake_action(void) {
+    uint32_t causes = esp_sleep_get_wakeup_causes();
+    if ((causes & BIT(ESP_SLEEP_WAKEUP_EXT1)) == 0) {
+        return WAKE_ACTION_NONE;
+    }
+    uint64_t mask = esp_sleep_get_ext1_wakeup_status();
+    return wake_action_from_mask(mask);
+}
+
 static void IRAM_ATTR button_isr_handler(void *arg) {
     button_id_t btn = (button_id_t)(int)arg;
     button_event_t evt = {
@@ -118,11 +142,13 @@ static void IRAM_ATTR button_isr_handler(void *arg) {
 }
 
 static esp_lcd_panel_handle_t panel_handle = NULL;
-static TickType_t s_last_ws_start_attempt = 0;
+static wake_action_t s_pending_wake_action = WAKE_ACTION_NONE;
+static TickType_t s_menu_guard_until = 0;
 
 // --- Display ---
 void app_main(void)
 {
+    s_pending_wake_action = detect_wake_action();
     // NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -208,7 +234,7 @@ void app_main(void)
         out_buf = esp_lcd_i80_alloc_draw_buffer(io_handle, out_buf_size, MALLOC_CAP_INTERNAL);
     }
     if (out_buf) {
-        render_status_screen(panel_handle, (uint16_t *)out_buf, "BOOTING", "Initializing display", 0x0000, 0xFFFF, s_wifi_connected, step_wss_is_connected());
+        render_status_screen(panel_handle, (uint16_t *)out_buf, "BOOTING", "Initializing display", 0x0000, 0xFFFF, s_wifi_connected);
     } else {
         size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
         ESP_LOGE(TAG, "No decode buffer available; largest free block: %lu bytes", (unsigned long)largest);
@@ -242,7 +268,6 @@ void app_main(void)
         .lcd_y_offset = LCD_Y_OFFSET,
         .panel = panel_handle,
         .button_queue = s_button_queue,
-        .last_ws_start_attempt = &s_last_ws_start_attempt,
         .wifi_connected = &s_wifi_connected,
     };
 
@@ -260,14 +285,14 @@ void app_main(void)
     int menu_selected = 0;
     TickType_t last_switch_tick = xTaskGetTickCount();
     bool wifi_was_connected = s_wifi_connected;
-    bool ws_was_connected = step_wss_is_connected();
     TickType_t last_wifi_retry_tick = xTaskGetTickCount();
-    if (startup_ctx.step == START_STEP_READY && images_count > 0 && images[0].valid && out_buf) {
-        if (images_fetch_and_show(&images[0], (uint16_t *)out_buf, out_buf_size, panel_handle, s_wifi_connected, step_wss_is_connected())) {
+    if (s_pending_wake_action == WAKE_ACTION_NONE &&
+        startup_ctx.step == START_STEP_READY && images_count > 0 && images[0].valid && out_buf) {
+        if (images_fetch_and_show(&images[0], (uint16_t *)out_buf, out_buf_size, panel_handle, s_wifi_connected)) {
             current_image = (images_count > 1) ? 1 : 0;
             last_switch_tick = xTaskGetTickCount();
         } else if (!s_wifi_connected) {
-            render_status_screen(panel_handle, (uint16_t *)out_buf, "Images", "Need Wi-Fi", 0x0000, 0xF800, s_wifi_connected, step_wss_is_connected());
+            render_status_screen(panel_handle, (uint16_t *)out_buf, "Images", "Need Wi-Fi", 0x0000, 0xF800, s_wifi_connected);
             startup_ctx.step = START_STEP_DIGEST; // need Wi-Fi to download images
         }
     }
@@ -275,9 +300,7 @@ void app_main(void)
         TickType_t now_tick = xTaskGetTickCount();
         bool wifi_state_changed = (s_wifi_connected != wifi_was_connected);
         bool wifi_just_connected = s_wifi_connected && !wifi_was_connected;
-        bool ws_state_changed = (step_wss_is_connected() != ws_was_connected);
         wifi_was_connected = s_wifi_connected;
-        ws_was_connected = step_wss_is_connected();
 
         bool driver_connected = wifi_ctrl_refresh_link();
         if (!driver_connected && (now_tick - last_wifi_retry_tick) >= pdMS_TO_TICKS(WIFI_RECONNECT_INTERVAL_MS)) {
@@ -286,42 +309,110 @@ void app_main(void)
             esp_wifi_connect();
         }
 
-        if (!s_wifi_connected && step_wss_has_client()) {
-            ESP_LOGI(TAG, "Wi-Fi down; stopping WebSocket");
-            step_wss_stop();
-        }
-        if (!step_wss_has_client() && s_wifi_connected &&
-            startup_ctx.step == START_STEP_WSS) {
-            if (out_buf) {
-                render_status_screen(panel_handle, (uint16_t *)out_buf, "WebSocket", NULL, 0x0000, 0xFFFF, s_wifi_connected, step_wss_is_connected());
-            }
-            vTaskDelay(pdMS_TO_TICKS(STEP_DEBUG_PAUSE_MS));
-        }
-
-        if (!step_wss_has_client() && s_wifi_connected &&
-            (s_last_ws_start_attempt == 0 || (now_tick - s_last_ws_start_attempt) >= pdMS_TO_TICKS(WS_RETRY_INTERVAL_MS))) {
-            s_last_ws_start_attempt = now_tick;
-            step_wss_start();
-        }
-
-        startup_handle_loop(&startup_ctx, s_wifi_connected, wifi_state_changed, wifi_just_connected, ws_state_changed, menu_visible, images, (uint16_t *)out_buf, out_buf_size, panel_handle, &last_switch_tick, &current_image, STEP_DEBUG_PAUSE_MS, STATUS_ERROR_PAUSE_MS);
+        startup_handle_loop(&startup_ctx, s_wifi_connected, wifi_state_changed, wifi_just_connected, menu_visible, images, (uint16_t *)out_buf, out_buf_size, panel_handle, &last_switch_tick, &current_image, STEP_DEBUG_PAUSE_MS, STATUS_ERROR_PAUSE_MS);
 
         images_count = startup_ctx.images_count;
 
-        if ((wifi_state_changed || ws_state_changed) && out_buf) {
-            icons_draw_status_badges((uint16_t *)out_buf, s_wifi_connected, step_wss_is_connected());
+        if (wifi_state_changed && out_buf) {
+            icons_draw_status_badges((uint16_t *)out_buf, s_wifi_connected);
             render_panel_draw_bitmap_chunked(panel_handle, (uint16_t *)out_buf, LCD_H_RES, LCD_V_RES);
+        }
+
+        if (s_pending_wake_action != WAKE_ACTION_NONE) {
+            menu_visible = false;
+            if (s_pending_wake_action == WAKE_ACTION_TRIGGER) {
+                while (1) {
+                    if (!s_wifi_connected) {
+                        if (out_buf) {
+                            render_status_screen(panel_handle, (uint16_t *)out_buf, "Trigger", "Waiting Wi-Fi", 0x0000, 0xF800, s_wifi_connected);
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(WIFI_RECONNECT_INTERVAL_MS));
+                        continue;
+                    }
+                    if (out_buf) {
+                        render_status_screen(panel_handle, (uint16_t *)out_buf, "Trigger", "Sending...", 0x0000, 0xFFFF, s_wifi_connected);
+                    }
+                    esp_err_t post_err = trigger_send();
+                    if (post_err == ESP_OK) {
+                        if (out_buf) {
+                            render_status_screen(panel_handle, (uint16_t *)out_buf, "Trigger sent", "Success", 0x0000, 0x07E0, s_wifi_connected);
+                        }
+                        break;
+                    }
+                    if (out_buf) {
+                        render_status_screen(panel_handle, (uint16_t *)out_buf, "Trigger failed", esp_err_to_name(post_err), 0x0000, 0xF800, s_wifi_connected);
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(STATUS_ERROR_PAUSE_MS));
+                }
+                if (out_buf) {
+                    render_status_screen(panel_handle, (uint16_t *)out_buf, "Fast sleep", "Press button to wake", 0x0000, 0xFFFF, s_wifi_connected);
+                }
+                sleep_enter_fast(&sleep_ctx);
+                s_pending_wake_action = detect_wake_action();
+                if (out_buf) {
+                    render_status_screen(panel_handle, (uint16_t *)out_buf, "Waking", "Restoring...", 0x0000, 0xFFFF, s_wifi_connected);
+                }
+                last_switch_tick = xTaskGetTickCount();
+                continue;
+            }
+            if (s_pending_wake_action == WAKE_ACTION_DIGEST) {
+                while (1) {
+                    if (!s_wifi_connected) {
+                        if (out_buf) {
+                            render_status_screen(panel_handle, (uint16_t *)out_buf, "Digest", "Waiting Wi-Fi", 0x0000, 0xF800, s_wifi_connected);
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(WIFI_RECONNECT_INTERVAL_MS));
+                        continue;
+                    }
+                    if (out_buf) {
+                        render_status_screen(panel_handle, (uint16_t *)out_buf, "Digest", "Downloading...", 0x0000, 0xFFFF, s_wifi_connected);
+                    }
+                    step_digest_begin(&startup_ctx.steps_state, (uint16_t *)out_buf);
+                    startup_ctx.steps_state.wifi_connected = s_wifi_connected;
+                    int new_count = startup_ctx.images_count;
+                    bool ok = step_digest_attempt(&startup_ctx.steps_state, (uint16_t *)out_buf, &new_count);
+                    startup_ctx.digest_pending = startup_ctx.steps_state.digest_pending;
+                    if (ok && new_count > 0) {
+                        startup_ctx.images_count = new_count;
+                        startup_ctx.current_image = 0;
+                        startup_ctx.step = startup_ctx.steps_state.step;
+                        images_count = new_count;
+                        if (images[0].valid && out_buf) {
+                            if (images_fetch_and_show(&images[0], (uint16_t *)out_buf, out_buf_size, panel_handle, s_wifi_connected)) {
+                                current_image = (new_count > 1) ? 1 : 0;
+                                last_switch_tick = xTaskGetTickCount();
+                            } else {
+                                startup_ctx.step = START_STEP_DIGEST;
+                            }
+                        }
+                        s_pending_wake_action = WAKE_ACTION_NONE;
+                        s_menu_guard_until = xTaskGetTickCount() + pdMS_TO_TICKS(MENU_WAKE_GUARD_MS);
+                        if (s_button_queue) {
+                            xQueueReset(s_button_queue);
+                        }
+                        break;
+                    }
+                    if (out_buf) {
+                        render_status_screen(panel_handle, (uint16_t *)out_buf, "Digest error", "No data", 0x0000, 0xF800, s_wifi_connected);
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(STATUS_ERROR_PAUSE_MS));
+                }
+            }
         }
 
         // Startup state machine handled by startup_handle_loop above
 
         button_event_t evt;
         while (xQueueReceive(s_button_queue, &evt, 0) == pdTRUE) {
+            bool skip_loop = false;
             TickType_t *last_tick = (evt.id == BTN_ID_MENU) ? &last_press_tick_menu : &last_press_tick_trigger;
             if ((evt.tick - *last_tick) < pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS)) {
                 continue;
             }
             *last_tick = evt.tick;
+            if (evt.id == BTN_ID_MENU && s_menu_guard_until != 0 && now_tick < s_menu_guard_until) {
+                continue;
+            }
 
             if (evt.id == BTN_ID_MENU) {
                 if (!out_buf) {
@@ -332,12 +423,12 @@ void app_main(void)
                     menu_visible = true;
                     // Начинаем выбор сразу с FAST SLEEP (недоступные пункты пропускаем)
                     menu_selected = MENU_ITEM_FAST_SLEEP;
-                    menu_render(panel_handle, (uint16_t *)out_buf, menu_selected, battery_read_mv(), s_wifi_connected, step_wss_is_connected());
+                    menu_render(panel_handle, (uint16_t *)out_buf, menu_selected, battery_read_mv(), s_wifi_connected);
                 } else {
                     // Переключаемся только между FAST SLEEP и DEEP SLEEP; затем выходим из меню
                     if (menu_selected == MENU_ITEM_FAST_SLEEP) {
                         menu_selected = MENU_ITEM_DEEP_SLEEP;
-                        menu_render(panel_handle, (uint16_t *)out_buf, menu_selected, battery_read_mv(), s_wifi_connected, step_wss_is_connected());
+                        menu_render(panel_handle, (uint16_t *)out_buf, menu_selected, battery_read_mv(), s_wifi_connected);
                     } else {
                         // Были на DEEP SLEEP — закрываем меню
                         menu_visible = false;
@@ -348,64 +439,78 @@ void app_main(void)
                 if (menu_visible) {
                     if (menu_selected == MENU_ITEM_FAST_SLEEP) {
                         if (out_buf) {
-                            render_status_screen(panel_handle, (uint16_t *)out_buf, "Fast sleep", "Press button to wake", 0x0000, 0xFFFF, s_wifi_connected, step_wss_is_connected());
+                            render_status_screen(panel_handle, (uint16_t *)out_buf, "Fast sleep", "Press button to wake", 0x0000, 0xFFFF, s_wifi_connected);
                         }
                         sleep_enter_fast(&sleep_ctx);
+                        s_pending_wake_action = detect_wake_action();
                         menu_visible = false;
                         if (out_buf) {
-                            render_status_screen(panel_handle, (uint16_t *)out_buf, "Waking", "Restoring...", 0x0000, 0xFFFF, s_wifi_connected, step_wss_is_connected());
+                            render_status_screen(panel_handle, (uint16_t *)out_buf, "Waking", "Restoring...", 0x0000, 0xFFFF, s_wifi_connected);
                         }
                         last_switch_tick = xTaskGetTickCount();
+                        skip_loop = true;
                     } else if (menu_selected == MENU_ITEM_DEEP_SLEEP) {
                         if (out_buf) {
-                            render_status_screen(panel_handle, (uint16_t *)out_buf, "Powering off", "Entering deep sleep", 0x0000, 0xFFFF, s_wifi_connected, step_wss_is_connected());
+                            render_status_screen(panel_handle, (uint16_t *)out_buf, "Powering off", "Entering deep sleep", 0x0000, 0xFFFF, s_wifi_connected);
                         }
                         sleep_enter_deep(&sleep_ctx);
                     }
                 } else {
                     ESP_LOGI(TAG, "Button 0 Pressed! Sending Trigger...");
-                    if (!s_wifi_connected) {
-                        ESP_LOGW(TAG, "Trigger skipped: Wi-Fi not connected");
-                        if (out_buf) {
-                            render_status_screen(panel_handle, (uint16_t *)out_buf, "Trigger skipped", "No Wi-Fi connection", 0x0000, 0xF800, s_wifi_connected, step_wss_is_connected());
-                            last_switch_tick = now_tick;
+                    while (1) {
+                        if (!s_wifi_connected) {
+                            ESP_LOGW(TAG, "Trigger waiting for Wi-Fi...");
+                            if (out_buf) {
+                                render_status_screen(panel_handle, (uint16_t *)out_buf, "Trigger", "Waiting Wi-Fi", 0x0000, 0xF800, s_wifi_connected);
+                            }
+                            vTaskDelay(pdMS_TO_TICKS(WIFI_RECONNECT_INTERVAL_MS));
+                            continue;
                         }
-                        vTaskDelay(pdMS_TO_TICKS(STATUS_ERROR_PAUSE_MS));
-                    } else {
                         if (out_buf) {
-                            render_status_screen(panel_handle, (uint16_t *)out_buf, "Trigger", "Sending...", 0x0000, 0xFFFF, s_wifi_connected, step_wss_is_connected());
+                            render_status_screen(panel_handle, (uint16_t *)out_buf, "Trigger", "Sending...", 0x0000, 0xFFFF, s_wifi_connected);
                         }
                         esp_err_t post_err = trigger_send();
-
                         if (post_err == ESP_OK) {
                             ESP_LOGI(TAG, "Trigger Sent.");
                             if (out_buf) {
-                                render_status_screen(panel_handle, (uint16_t *)out_buf, "Trigger sent", "Success", 0x0000, 0x07E0, s_wifi_connected, step_wss_is_connected());
-                                last_switch_tick = now_tick;
+                                render_status_screen(panel_handle, (uint16_t *)out_buf, "Trigger sent", "Success", 0x0000, 0x07E0, s_wifi_connected);
                             }
-                        } else {
-                            ESP_LOGE(TAG, "Trigger Failed: %s", esp_err_to_name(post_err));
-                            if (out_buf) {
-                                render_status_screen(panel_handle, (uint16_t *)out_buf, "Trigger failed", esp_err_to_name(post_err), 0x0000, 0xF800, s_wifi_connected, step_wss_is_connected());
-                                last_switch_tick = now_tick;
-                            }
-                            vTaskDelay(pdMS_TO_TICKS(STATUS_ERROR_PAUSE_MS));
+                            break;
                         }
+                        ESP_LOGE(TAG, "Trigger Failed: %s", esp_err_to_name(post_err));
+                        if (out_buf) {
+                            render_status_screen(panel_handle, (uint16_t *)out_buf, "Trigger failed", esp_err_to_name(post_err), 0x0000, 0xF800, s_wifi_connected);
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(STATUS_ERROR_PAUSE_MS));
                     }
+                    if (out_buf) {
+                        render_status_screen(panel_handle, (uint16_t *)out_buf, "Fast sleep", "Press button to wake", 0x0000, 0xFFFF, s_wifi_connected);
+                    }
+                    sleep_enter_fast(&sleep_ctx);
+                    s_pending_wake_action = detect_wake_action();
+                    if (out_buf) {
+                        render_status_screen(panel_handle, (uint16_t *)out_buf, "Waking", "Restoring...", 0x0000, 0xFFFF, s_wifi_connected);
+                    }
+                    last_switch_tick = xTaskGetTickCount();
+                    skip_loop = true;
                 }
+            }
+            if (skip_loop) {
+                break;
             }
         }
 
-        if (!menu_visible && images_count > 0 && startup_ctx.step == START_STEP_READY) {
+        if (!menu_visible && s_pending_wake_action == WAKE_ACTION_NONE &&
+            images_count > 0 && startup_ctx.step == START_STEP_READY) {
             if ((now_tick - last_switch_tick) >= pdMS_TO_TICKS(IMAGE_ROTATION_INTERVAL_MS)) {
                 last_switch_tick = now_tick;
                 image_slot_t *img = &images[current_image];
                 if (img->valid && out_buf) {
                     bool needs_download = !img->loaded;
                     if (needs_download && !s_wifi_connected) {
-                        render_status_screen(panel_handle, (uint16_t *)out_buf, "Images", "Need Wi-Fi", 0x0000, 0xF800, s_wifi_connected, step_wss_is_connected());
+                        render_status_screen(panel_handle, (uint16_t *)out_buf, "Images", "Need Wi-Fi", 0x0000, 0xF800, s_wifi_connected);
                         startup_ctx.step = START_STEP_DIGEST; // block slideshow until Wi-Fi returns
-                    } else if (!images_fetch_and_show(img, (uint16_t *)out_buf, out_buf_size, panel_handle, s_wifi_connected, step_wss_is_connected())) {
+                    } else if (!images_fetch_and_show(img, (uint16_t *)out_buf, out_buf_size, panel_handle, s_wifi_connected)) {
                         ESP_LOGE(TAG, "Failed to display image %d", current_image);
                     } else {
                         current_image = (current_image + 1) % images_count;

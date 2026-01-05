@@ -3,7 +3,6 @@ idf_component_register(
         "main.c"
         "steps/step_wifi.c"
         "steps/step_sntp.c"
-        "steps/step_wss.c"
         "steps/step_digest.c"
         "sleep/sleep.c"
         "menu/menu.c"
@@ -12,7 +11,6 @@ idf_component_register(
         "startup/startup.c"
         "net/wifi_ctrl.c"
         "net/trigger.c"
-        "net/ws_handler.c"
         "power/battery.c"
         "images/images.c"
         "tls/certs.c"
@@ -30,4 +28,4 @@ idf_component_register(
         "images"
         "tls"
         "util"
-    REQUIRES esp_wifi esp_event nvs_flash esp_netif esp_http_client esp_websocket_client esp-tls esp_jpeg driver esp_lcd esp_adc json)
+    REQUIRES esp_wifi esp_event nvs_flash esp_netif esp_http_client esp-tls esp_jpeg driver esp_lcd esp_adc json)

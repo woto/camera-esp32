@@ -60,7 +60,7 @@ static const uint8_t font5x7[95][5] = {
     {0x44, 0x28, 0x10, 0x28, 0x44}, {0x0c, 0x50, 0x50, 0x50, 0x3c},
     {0x44, 0x64, 0x54, 0x4c, 0x44}, {0x00, 0x08, 0x36, 0x41, 0x00},
     {0x00, 0x00, 0x7f, 0x00, 0x00}, {0x00, 0x41, 0x36, 0x08, 0x00},
-    {0x08, 0x04, 0x08, 0x10, 0x08}, {0x78, 0x46, 0x41, 0x46, 0x78},
+    {0x08, 0x04, 0x08, 0x10, 0x08},
 };
 
 static DMA_ATTR uint16_t s_chunk_buf[2][LCD_DMA_CHUNK_BYTES / sizeof(uint16_t)] __attribute__((aligned(LCD_DMA_ALIGN)));
@@ -176,7 +176,7 @@ void render_draw_text(uint16_t *frame_buf, int x, int y, const char *text, uint1
     }
 }
 
-void render_status_screen(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, const char *line1, const char *line2, uint16_t bg_color, uint16_t fg_color, bool wifi_connected, bool ws_connected) {
+void render_status_screen(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, const char *line1, const char *line2, uint16_t bg_color, uint16_t fg_color, bool wifi_connected) {
     if (!frame_buf || !panel) return;
     render_framebuf_fill_color(frame_buf, bg_color);
     int y = (LCD_V_RES / 2) - (FONT_HEIGHT * FONT_SCALE);
@@ -190,6 +190,6 @@ void render_status_screen(esp_lcd_panel_handle_t panel, uint16_t *frame_buf, con
         if (x < 0) x = 0;
         render_draw_text(frame_buf, x, y + FONT_HEIGHT * FONT_SCALE + 10, line2, fg_color);
     }
-    icons_draw_status_badges(frame_buf, wifi_connected, ws_connected);
+    icons_draw_status_badges(frame_buf, wifi_connected);
     render_panel_draw_bitmap_chunked(panel, frame_buf, LCD_H_RES, LCD_V_RES);
 }

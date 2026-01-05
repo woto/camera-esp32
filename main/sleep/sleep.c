@@ -6,7 +6,6 @@
 #include "esp_sleep.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
-#include "steps/steps.h"
 
 static const char *TAG = "SLEEP";
 
@@ -60,7 +59,6 @@ void sleep_enter_fast(const sleep_ctx_t *ctx) {
     while (gpio_get_level(ctx->button_gpio_1) == 0 || gpio_get_level(ctx->button_gpio_2) == 0) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
-    step_wss_stop();
     if (ctx->wifi_connected) {
         *ctx->wifi_connected = false;
     }
@@ -98,9 +96,6 @@ void sleep_enter_fast(const sleep_ctx_t *ctx) {
     }
     if (ctx->pin_bl >= 0) {
         gpio_set_level((gpio_num_t)ctx->pin_bl, 1);
-    }
-    if (ctx->last_ws_start_attempt) {
-        *ctx->last_ws_start_attempt = 0;
     }
     if (ctx->button_queue) {
         xQueueReset(ctx->button_queue);
