@@ -74,14 +74,11 @@ bool wifi_ctrl_is_connected(void) {
 
 bool wifi_ctrl_refresh_link(void) {
     bool driver_connected = wifi_driver_connected();
-    if (driver_connected && !s_wifi_connected) {
-        s_wifi_connected = true;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    } else if (!driver_connected && s_wifi_connected) {
+    if (!driver_connected && s_wifi_connected) {
         s_wifi_connected = false;
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
-    return s_wifi_connected;
+    return driver_connected;
 }
 
 esp_err_t wifi_ctrl_connect(void) {

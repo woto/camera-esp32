@@ -127,6 +127,18 @@ static wake_action_t detect_wake_action(void) {
     return wake_action_from_mask(mask);
 }
 
+static const char *wake_action_name(wake_action_t action) {
+    switch (action) {
+        case WAKE_ACTION_TRIGGER:
+            return "trigger";
+        case WAKE_ACTION_DIGEST:
+            return "digest";
+        case WAKE_ACTION_NONE:
+        default:
+            return "none";
+    }
+}
+
 static void IRAM_ATTR button_isr_handler(void *arg) {
     button_id_t btn = (button_id_t)(int)arg;
     button_event_t evt = {
@@ -150,6 +162,7 @@ static TickType_t s_menu_guard_until = 0;
 void app_main(void)
 {
     s_pending_wake_action = detect_wake_action();
+    ESP_LOGI(TAG, "Wake action: %s", wake_action_name(s_pending_wake_action));
     // NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -323,8 +336,10 @@ void app_main(void)
         if (s_pending_wake_action != WAKE_ACTION_NONE) {
             menu_visible = false;
             if (s_pending_wake_action == WAKE_ACTION_TRIGGER) {
+                ESP_LOGI(TAG, "Wake trigger flow: waiting for Wi-Fi");
                 while (1) {
                     if (!s_wifi_connected) {
+                        ESP_LOGW(TAG, "Wake trigger: Wi-Fi not connected yet");
                         if (out_buf) {
                             render_status_screen(panel_handle, (uint16_t *)out_buf, "Trigger", "Waiting Wi-Fi", 0x0000, 0xF800, s_wifi_connected);
                         }
@@ -335,6 +350,7 @@ void app_main(void)
                         render_status_screen(panel_handle, (uint16_t *)out_buf, "Trigger", "Sending...", 0x0000, 0xFFFF, s_wifi_connected);
                     }
                     esp_err_t post_err = trigger_send();
+                    ESP_LOGI(TAG, "Wake trigger: trigger_send -> %s", esp_err_to_name(post_err));
                     if (post_err == ESP_OK) {
                         if (out_buf) {
                             render_status_screen(panel_handle, (uint16_t *)out_buf, "Trigger sent", "Success", 0x0000, 0x07E0, s_wifi_connected);
@@ -358,8 +374,10 @@ void app_main(void)
                 continue;
             }
             if (s_pending_wake_action == WAKE_ACTION_DIGEST) {
+                ESP_LOGI(TAG, "Wake digest flow: waiting for Wi-Fi");
                 while (1) {
                     if (!s_wifi_connected) {
+                        ESP_LOGW(TAG, "Wake digest: Wi-Fi not connected yet");
                         if (out_buf) {
                             render_status_screen(panel_handle, (uint16_t *)out_buf, "Digest", "Waiting Wi-Fi", 0x0000, 0xF800, s_wifi_connected);
                         }
@@ -373,6 +391,7 @@ void app_main(void)
                     startup_ctx.steps_state.wifi_connected = s_wifi_connected;
                     int new_count = startup_ctx.images_count;
                     bool ok = step_digest_attempt(&startup_ctx.steps_state, (uint16_t *)out_buf, &new_count);
+                    ESP_LOGI(TAG, "Wake digest: step_digest_attempt ok=%d new_count=%d", ok ? 1 : 0, new_count);
                     startup_ctx.digest_pending = startup_ctx.steps_state.digest_pending;
                     if (ok && new_count > 0) {
                         startup_ctx.images_count = new_count;
@@ -392,11 +411,13 @@ void app_main(void)
                         if (s_button_queue) {
                             xQueueReset(s_button_queue);
                         }
+                        ESP_LOGI(TAG, "Wake digest: success, images=%d", new_count);
                         break;
                     }
                     if (out_buf) {
                         render_status_screen(panel_handle, (uint16_t *)out_buf, "Digest error", "No data", 0x0000, 0xF800, s_wifi_connected);
                     }
+                    ESP_LOGW(TAG, "Wake digest: no data, retrying");
                     vTaskDelay(pdMS_TO_TICKS(STATUS_ERROR_PAUSE_MS));
                 }
             }
@@ -526,11 +547,13 @@ void app_main(void)
 
         if (s_pending_wake_action == WAKE_ACTION_NONE &&
             (now_tick - last_button_activity) >= pdMS_TO_TICKS(INACTIVITY_FAST_SLEEP_MS)) {
+            ESP_LOGI(TAG, "Inactivity timeout: entering fast sleep");
             if (out_buf) {
                 render_status_screen(panel_handle, (uint16_t *)out_buf, "Fast sleep", "Press button to wake", 0x0000, 0xFFFF, s_wifi_connected);
             }
             sleep_enter_fast(&sleep_ctx);
             s_pending_wake_action = detect_wake_action();
+            ESP_LOGI(TAG, "Wake action: %s", wake_action_name(s_pending_wake_action));
             if (out_buf) {
                 render_status_screen(panel_handle, (uint16_t *)out_buf, "Waking", "Restoring...", 0x0000, 0xFFFF, s_wifi_connected);
             }
