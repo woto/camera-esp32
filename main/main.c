@@ -70,6 +70,7 @@
 #define BUTTON_GPIO_2 14
 #define BUTTON_DEBOUNCE_MS 250
 #define IMAGE_ROTATION_INTERVAL_MS 1000
+#define INACTIVITY_FAST_SLEEP_MS 30000
 #define STATUS_ERROR_PAUSE_MS 1200
 #define WIFI_RECONNECT_INTERVAL_MS 1000
 #define STEP_DEBUG_PAUSE_MS 1000
@@ -281,6 +282,7 @@ void app_main(void)
     // --- Loop ---
     TickType_t last_press_tick_trigger = 0;
     TickType_t last_press_tick_menu = 0;
+    TickType_t last_button_activity = xTaskGetTickCount();
     bool menu_visible = false;
     int menu_selected = 0;
     TickType_t last_switch_tick = xTaskGetTickCount();
@@ -413,6 +415,7 @@ void app_main(void)
             if (evt.id == BTN_ID_MENU && s_menu_guard_until != 0 && now_tick < s_menu_guard_until) {
                 continue;
             }
+            last_button_activity = now_tick;
 
             if (evt.id == BTN_ID_MENU) {
                 if (!out_buf) {
@@ -519,6 +522,21 @@ void app_main(void)
             }
         } else if (menu_visible) {
             last_switch_tick = now_tick;
+        }
+
+        if (s_pending_wake_action == WAKE_ACTION_NONE &&
+            (now_tick - last_button_activity) >= pdMS_TO_TICKS(INACTIVITY_FAST_SLEEP_MS)) {
+            if (out_buf) {
+                render_status_screen(panel_handle, (uint16_t *)out_buf, "Fast sleep", "Press button to wake", 0x0000, 0xFFFF, s_wifi_connected);
+            }
+            sleep_enter_fast(&sleep_ctx);
+            s_pending_wake_action = detect_wake_action();
+            if (out_buf) {
+                render_status_screen(panel_handle, (uint16_t *)out_buf, "Waking", "Restoring...", 0x0000, 0xFFFF, s_wifi_connected);
+            }
+            last_switch_tick = xTaskGetTickCount();
+            last_button_activity = last_switch_tick;
+            menu_visible = false;
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));
