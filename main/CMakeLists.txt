@@ -15,6 +15,7 @@ idf_component_register(
         "images/images.c"
         "tls/certs.c"
         "util/room_id.c"
+        "util/mac_store.c"
     INCLUDE_DIRS
         "."
         "steps"

@@ -37,6 +37,7 @@
 #include "net/trigger.h"
 #include "images/images.h"
 #include "power/battery.h"
+#include "util/mac_store.h"
 
 // JPEG Decoder
 #include "jpeg_decoder.h"
@@ -170,6 +171,12 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    esp_err_t mac_err = mac_store_apply();
+    if (mac_err == ESP_OK) {
+        ESP_LOGI(TAG, "Stored MAC applied");
+    } else if (mac_err != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "Stored MAC apply error: %s", esp_err_to_name(mac_err));
+    }
 
     // GPIO Hold Dis
     if (PIN_NUM_BL >= 0) {
@@ -445,23 +452,44 @@ void app_main(void)
                 }
                 if (!menu_visible) {
                     menu_visible = true;
-                    // Начинаем выбор сразу с FAST SLEEP (недоступные пункты пропускаем)
-                    menu_selected = MENU_ITEM_FAST_SLEEP;
+                    // Начинаем выбор с ID, чтобы можно было сменить MAC.
+                    menu_selected = MENU_ITEM_DEVICE_ID;
                     menu_render(panel_handle, (uint16_t *)out_buf, menu_selected, battery_read_mv(), s_wifi_connected);
                 } else {
-                    // Переключаемся только между FAST SLEEP и DEEP SLEEP; затем выходим из меню
-                    if (menu_selected == MENU_ITEM_FAST_SLEEP) {
+                    // Переключаемся между ID -> FAST SLEEP -> DEEP SLEEP; затем выходим из меню
+                    if (menu_selected == MENU_ITEM_DEVICE_ID) {
+                        menu_selected = MENU_ITEM_FAST_SLEEP;
+                    } else if (menu_selected == MENU_ITEM_FAST_SLEEP) {
                         menu_selected = MENU_ITEM_DEEP_SLEEP;
+                    } else {
+                        menu_visible = false;
+                    }
+                    if (menu_visible) {
                         menu_render(panel_handle, (uint16_t *)out_buf, menu_selected, battery_read_mv(), s_wifi_connected);
                     } else {
-                        // Были на DEEP SLEEP — закрываем меню
-                        menu_visible = false;
                         render_fill_color(panel_handle, (uint16_t *)out_buf, 0x0000);
                     }
                 }
             } else if (evt.id == BTN_ID_TRIGGER) {
                 if (menu_visible) {
-                    if (menu_selected == MENU_ITEM_FAST_SLEEP) {
+                    if (menu_selected == MENU_ITEM_DEVICE_ID) {
+                        uint8_t new_mac[6];
+                        mac_generate_random(new_mac);
+                        esp_err_t save_err = mac_store_save(new_mac);
+                        if (save_err == ESP_OK) {
+                            if (out_buf) {
+                                render_status_screen(panel_handle, (uint16_t *)out_buf, "MAC updated", "Rebooting...", 0x0000, 0x07E0, s_wifi_connected);
+                            }
+                            vTaskDelay(pdMS_TO_TICKS(400));
+                            esp_restart();
+                        } else {
+                            if (out_buf) {
+                                render_status_screen(panel_handle, (uint16_t *)out_buf, "MAC update failed", esp_err_to_name(save_err), 0x0000, 0xF800, s_wifi_connected);
+                                vTaskDelay(pdMS_TO_TICKS(STATUS_ERROR_PAUSE_MS));
+                                menu_render(panel_handle, (uint16_t *)out_buf, menu_selected, battery_read_mv(), s_wifi_connected);
+                            }
+                        }
+                    } else if (menu_selected == MENU_ITEM_FAST_SLEEP) {
                         if (out_buf) {
                             render_status_screen(panel_handle, (uint16_t *)out_buf, "Fast sleep", "Press button to wake", 0x0000, 0xFFFF, s_wifi_connected);
                         }
